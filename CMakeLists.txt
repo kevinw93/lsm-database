@@ -32,16 +32,21 @@ if(LSM_WERROR)
   target_compile_options(lsm_warnings INTERFACE -Werror)
 endif()
 
+find_package(Threads REQUIRED)
+
 add_library(lsm
   src/db/dbformat.cc
+  src/db/memtable.cc
+  src/db/skiplist.cc
   src/status.cc
   src/util/coding.cc
+  src/util/arena.cc
   src/util/crc32c.cc
 )
 target_include_directories(lsm
   PUBLIC  ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(lsm PRIVATE lsm_warnings)
+target_link_libraries(lsm PUBLIC Threads::Threads PRIVATE lsm_warnings)
 
 if(LSM_BUILD_TESTS)
   enable_testing()
