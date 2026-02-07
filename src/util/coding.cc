@@ -60,7 +60,8 @@ template <unsigned kBits>
 const char* DecodeVarint(const char* p, const char* limit,
                          std::uint64_t* value) {
   constexpr unsigned kLastShift = ((kBits - 1) / 7) * 7;
-  constexpr std::uint64_t kLastByteMax = (std::uint64_t{1} << (kBits - kLastShift)) - 1;
+  constexpr std::uint64_t kLastByteMax =
+      (std::uint64_t{1} << (kBits - kLastShift)) - 1;
 
   std::uint64_t result = 0;
   for (unsigned shift = 0; shift <= kLastShift && p < limit; shift += 7) {

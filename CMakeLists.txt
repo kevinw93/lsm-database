@@ -35,13 +35,18 @@ endif()
 find_package(Threads REQUIRED)
 
 add_library(lsm
+  src/db/db_impl.cc
   src/db/dbformat.cc
+  src/db/filename.cc
+  src/db/log.cc
   src/db/memtable.cc
   src/db/skiplist.cc
+  src/db/write_batch.cc
   src/status.cc
   src/util/coding.cc
   src/util/arena.cc
   src/util/crc32c.cc
+  src/util/file.cc
 )
 target_include_directories(lsm
   PUBLIC  ${PROJECT_SOURCE_DIR}/include

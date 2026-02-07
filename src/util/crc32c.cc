@@ -31,7 +31,8 @@ constexpr std::uint32_t ExtendImpl(std::uint32_t crc, std::string_view data) {
   return ~c;
 }
 
-static_assert(ExtendImpl(0, "123456789") == 0xE3069283u);  // standard check value
+// Standard CRC32C check value.
+static_assert(ExtendImpl(0, "123456789") == 0xE3069283u);
 static_assert(kTable[128] == kPolynomial);
 
 }  // namespace

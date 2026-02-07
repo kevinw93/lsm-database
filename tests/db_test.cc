@@ -1,0 +1,282 @@
+#include "lsm/db.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <memory>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "db/filename.h"
+#include "lsm/write_batch.h"
+#include "test_util.h"
+
+namespace lsm {
+namespace {
+
+class DBTest : public ::testing::Test {
+ protected:
+  void SetUp() override { ASSERT_TRUE(Reopen().ok()); }
+
+  Status Reopen(Options options = DefaultOptions()) {
+    db_.reset();
+    return DB::Open(dir_.path(), options, &db_);
+  }
+
+  static Options DefaultOptions() {
+    Options options;
+    options.create_if_missing = true;
+    return options;
+  }
+
+  Status Put(std::string_view k, std::string_view v, bool sync = false) {
+    WriteOptions options;
+    options.sync = sync;
+    return db_->Put(options, k, v);
+  }
+
+  std::string Get(std::string_view k) {
+    std::string value;
+    Status s = db_->Get(ReadOptions(), k, &value);
+    if (s.IsNotFound()) return "NOT_FOUND";
+    if (!s.ok()) return s.ToString();
+    return value;
+  }
+
+  std::vector<std::string> LogFiles() {
+    std::vector<std::string> logs;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_.path())) {
+      std::uint64_t number;
+      if (ParseLogFileName(entry.path().filename().string(), &number)) {
+        logs.push_back(entry.path().string());
+      }
+    }
+    std::sort(logs.begin(), logs.end());
+    return logs;
+  }
+
+  test::TempDir dir_;
+  std::unique_ptr<DB> db_;
+};
+
+TEST_F(DBTest, PutGetDelete) {
+  EXPECT_EQ(Get("k"), "NOT_FOUND");
+  ASSERT_TRUE(Put("k", "v1").ok());
+  EXPECT_EQ(Get("k"), "v1");
+  ASSERT_TRUE(Put("k", "v2").ok());
+  EXPECT_EQ(Get("k"), "v2");
+  ASSERT_TRUE(db_->Delete(WriteOptions(), "k").ok());
+  EXPECT_EQ(Get("k"), "NOT_FOUND");
+  ASSERT_TRUE(db_->Delete(WriteOptions(), "never-existed").ok());
+}
+
+TEST_F(DBTest, GetNotFoundLeavesValueUnchanged) {
+  std::string value = "untouched";
+  EXPECT_TRUE(db_->Get(ReadOptions(), "missing", &value).IsNotFound());
+  EXPECT_EQ(value, "untouched");
+}
+
+TEST_F(DBTest, EmptyAndBinaryKeysAndValues) {
+  const std::string key("\0\xff", 2);
+  ASSERT_TRUE(Put("", "empty-key").ok());
+  ASSERT_TRUE(Put("e", "").ok());
+  ASSERT_TRUE(Put(key, std::string("\0v", 2)).ok());
+  ASSERT_TRUE(Reopen().ok());
+  EXPECT_EQ(Get(""), "empty-key");
+  EXPECT_EQ(Get("e"), "");
+  EXPECT_EQ(Get(key), std::string("\0v", 2));
+}
+
+TEST_F(DBTest, WriteBatchAppliesInOrder) {
+  WriteBatch batch;
+  batch.Put("a", "1");
+  batch.Put("b", "2");
+  batch.Delete("a");
+  batch.Put("c", "3");
+  batch.Put("c", "4");
+  ASSERT_TRUE(db_->Write(WriteOptions(), batch).ok());
+  EXPECT_EQ(Get("a"), "NOT_FOUND");
+  EXPECT_EQ(Get("b"), "2");
+  EXPECT_EQ(Get("c"), "4");
+  EXPECT_TRUE(db_->Write(WriteOptions(), WriteBatch()).ok());
+}
+
+TEST_F(DBTest, DataSurvivesReopen) {
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_TRUE(Put("key" + std::to_string(i), "value" + std::to_string(i),
+                    /*sync=*/i % 100 == 0)
+                    .ok());
+  }
+  ASSERT_TRUE(db_->Delete(WriteOptions(), "key7").ok());
+  ASSERT_TRUE(Reopen().ok());
+  for (int i = 0; i < 1000; ++i) {
+    EXPECT_EQ(Get("key" + std::to_string(i)),
+              i == 7 ? "NOT_FOUND" : "value" + std::to_string(i));
+  }
+}
+
+TEST_F(DBTest, SequenceNumbersContinueAcrossReopens) {
+  // If sequence numbers restarted, the newer write would get a lower number
+  // than the older one and lose.
+  ASSERT_TRUE(Put("k", "v1").ok());
+  ASSERT_TRUE(Reopen().ok());
+  ASSERT_TRUE(Put("k", "v2").ok());
+  ASSERT_TRUE(Reopen().ok());
+  EXPECT_EQ(Get("k"), "v2");
+  ASSERT_TRUE(Reopen().ok());
+  EXPECT_EQ(Get("k"), "v2");
+}
+
+TEST_F(DBTest, TornTailIsDroppedAndLaterWritesSurvive) {
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(Put("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+  }
+  db_.reset();
+  const auto logs = LogFiles();
+  ASSERT_EQ(logs.size(), 1u);
+  std::filesystem::resize_file(logs[0],
+                               std::filesystem::file_size(logs[0]) - 3);
+
+  ASSERT_TRUE(Reopen().ok());
+  for (int i = 0; i < 9; ++i)
+    EXPECT_EQ(Get("k" + std::to_string(i)), "v" + std::to_string(i));
+  EXPECT_EQ(Get("k9"), "NOT_FOUND");
+
+  // These go into a new log, not after the torn record, so they must survive
+  // the next recovery.
+  ASSERT_TRUE(Put("k9", "again").ok());
+  ASSERT_TRUE(Put("k10", "v10").ok());
+  ASSERT_TRUE(Reopen().ok());
+  EXPECT_EQ(Get("k8"), "v8");
+  EXPECT_EQ(Get("k9"), "again");
+  EXPECT_EQ(Get("k10"), "v10");
+}
+
+TEST_F(DBTest, MidLogCorruptionRecoversThePrefix) {
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(Put("k" + std::to_string(i),
+                    std::string(100, static_cast<char>('a' + i)))
+                    .ok());
+  }
+  db_.reset();
+  const auto logs = LogFiles();
+  ASSERT_EQ(logs.size(), 1u);
+  {
+    std::FILE* f = std::fopen(logs[0].c_str(), "r+b");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, static_cast<long>(std::filesystem::file_size(logs[0]) / 2),
+               SEEK_SET);
+    const int c = std::fgetc(f);
+    std::fseek(f, -1, SEEK_CUR);
+    std::fputc(c ^ 0x10, f);
+    std::fclose(f);
+  }
+
+  ASSERT_TRUE(Reopen().ok());
+  int present = 0;
+  while (present < 10 && Get("k" + std::to_string(present)) != "NOT_FOUND")
+    ++present;
+  EXPECT_GT(present, 0);
+  EXPECT_LT(present, 10);
+  for (int i = present; i < 10; ++i)
+    EXPECT_EQ(Get("k" + std::to_string(i)), "NOT_FOUND");
+}
+
+TEST_F(DBTest, MissingDbWithoutCreateIfMissing) {
+  test::TempDir other;
+  std::unique_ptr<DB> db;
+  EXPECT_TRUE(
+      DB::Open(other.path() + "/db", Options(), &db).IsInvalidArgument());
+  EXPECT_EQ(db, nullptr);
+  EXPECT_TRUE(
+      DB::Open(other.path(), Options(), &db).IsInvalidArgument());  // empty dir
+}
+
+TEST_F(DBTest, ErrorIfExists) {
+  db_.reset();
+  Options options = DefaultOptions();
+  options.error_if_exists = true;
+  EXPECT_TRUE(Reopen(options).IsInvalidArgument());
+}
+
+TEST_F(DBTest, SecondOpenOfSameDirectoryFails) {
+  std::unique_ptr<DB> second;
+  EXPECT_TRUE(DB::Open(dir_.path(), DefaultOptions(), &second).IsIOError());
+  EXPECT_EQ(second, nullptr);
+  db_.reset();
+  EXPECT_TRUE(DB::Open(dir_.path(), DefaultOptions(), &second).ok());
+}
+
+TEST_F(DBTest, UnimplementedFeaturesSayNotSupported) {
+  auto it = db_->NewIterator(ReadOptions());
+  EXPECT_FALSE(it->Valid());
+  EXPECT_TRUE(it->status().IsNotSupported());
+}
+
+TEST_F(DBTest, ConcurrentWritersAndReaders) {
+  constexpr int kWriters = 4;
+  constexpr int kReaders = 4;
+  constexpr int kWritesPerThread = 1500;
+
+  std::atomic<int> acked[kWriters] = {};
+  std::atomic<bool> done{false};
+  std::atomic<int> failures{0};
+
+  std::vector<std::thread> writers;
+  for (int w = 0; w < kWriters; ++w) {
+    writers.emplace_back([&, w] {
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        WriteBatch batch;  // two keys that must become visible together
+        const std::string v = std::to_string(i);
+        batch.Put("w" + std::to_string(w) + "_" + v, v);
+        batch.Put("latest" + std::to_string(w), v);
+        if (!db_->Write(WriteOptions(), batch).ok()) failures.fetch_add(1);
+        acked[w].store(i + 1, std::memory_order_release);
+      }
+    });
+  }
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&, r] {
+      std::mt19937 rng(static_cast<unsigned>(r));
+      while (!done.load(std::memory_order_acquire)) {
+        const int w = static_cast<int>(rng() % kWriters);
+        const int n = acked[w].load(std::memory_order_acquire);
+        if (n == 0) continue;
+        const int i = static_cast<int>(rng() % static_cast<unsigned>(n));
+        std::string value;
+        if (!db_->Get(ReadOptions(),
+                      "w" + std::to_string(w) + "_" + std::to_string(i), &value)
+                 .ok() ||
+            value != std::to_string(i)) {
+          failures.fetch_add(1);
+        }
+        if (!db_->Get(ReadOptions(), "latest" + std::to_string(w), &value)
+                 .ok() ||
+            std::stoi(value) < n - 1) {
+          failures.fetch_add(1);
+        }
+      }
+    });
+  }
+
+  for (auto& t : writers) t.join();
+  done.store(true, std::memory_order_release);
+  for (auto& t : readers) t.join();
+  EXPECT_EQ(failures.load(), 0);
+
+  ASSERT_TRUE(Reopen().ok());
+  for (int w = 0; w < kWriters; ++w) {
+    EXPECT_EQ(Get("latest" + std::to_string(w)),
+              std::to_string(kWritesPerThread - 1));
+    EXPECT_EQ(Get("w" + std::to_string(w) + "_0"), "0");
+  }
+}
+
+}  // namespace
+}  // namespace lsm

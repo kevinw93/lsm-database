@@ -52,7 +52,8 @@ struct ParsedInternalKey {
 void AppendInternalKey(std::string* dst, const ParsedInternalKey& key);
 
 // nullopt if shorter than the trailer or the type is unknown.
-std::optional<ParsedInternalKey> ParseInternalKey(std::string_view internal_key);
+std::optional<ParsedInternalKey> ParseInternalKey(
+    std::string_view internal_key);
 
 // The functions below require a well-formed internal key.
 

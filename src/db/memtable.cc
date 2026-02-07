@@ -44,8 +44,7 @@ void MemTable::Add(SequenceNumber seq, ValueType type,
                 std::string_view(buf + ikey_size, value.size()));
 }
 
-MemTable::GetResult MemTable::Get(std::string_view user_key,
-                                  SequenceNumber seq,
+MemTable::GetResult MemTable::Get(std::string_view user_key, SequenceNumber seq,
                                   std::string* value) const {
   std::string seek_key;
   AppendInternalKey(&seek_key, {user_key, seq, kValueTypeForSeek});

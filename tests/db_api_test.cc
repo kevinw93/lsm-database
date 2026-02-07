@@ -1,8 +1,8 @@
-#include "lsm/db.h"
-
 #include <gtest/gtest.h>
 
 #include <type_traits>
+
+#include "lsm/db.h"
 
 namespace lsm {
 namespace {

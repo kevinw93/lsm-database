@@ -66,12 +66,12 @@ TEST(DbFormatTest, ParseRejectsMalformed) {
 }
 
 TEST(DbFormatTest, UserKeyAscendingDominatesSequence) {
-  EXPECT_TRUE(Less(IKey("a", 1, ValueType::kValue),
-                   IKey("b", 100, ValueType::kValue)));
-  EXPECT_TRUE(Less(IKey("a", 100, ValueType::kValue),
-                   IKey("b", 1, ValueType::kValue)));
-  EXPECT_TRUE(Less(IKey("a", 1, ValueType::kValue),
-                   IKey("ab", 1, ValueType::kValue)));
+  EXPECT_TRUE(
+      Less(IKey("a", 1, ValueType::kValue), IKey("b", 100, ValueType::kValue)));
+  EXPECT_TRUE(
+      Less(IKey("a", 100, ValueType::kValue), IKey("b", 1, ValueType::kValue)));
+  EXPECT_TRUE(
+      Less(IKey("a", 1, ValueType::kValue), IKey("ab", 1, ValueType::kValue)));
 }
 
 TEST(DbFormatTest, SequenceDescendingForSameUserKey) {

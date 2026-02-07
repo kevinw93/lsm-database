@@ -32,7 +32,8 @@ class DB {
                      std::string_view value) = 0;
   virtual Status Delete(const WriteOptions& options, std::string_view key) = 0;
   // Applies every update in the batch atomically.
-  virtual Status Write(const WriteOptions& options, const WriteBatch& batch) = 0;
+  virtual Status Write(const WriteOptions& options,
+                       const WriteBatch& batch) = 0;
 
   // NotFound if the key does not exist; *value is unchanged in that case.
   virtual Status Get(const ReadOptions& options, std::string_view key,

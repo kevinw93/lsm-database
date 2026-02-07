@@ -145,7 +145,8 @@ TEST(CodingTest, Varint32OverflowIsRejected) {
   EXPECT_EQ(v, std::numeric_limits<std::uint32_t>::max());
 
   const std::string over = Bytes({0xFF, 0xFF, 0xFF, 0xFF, 0x10});
-  EXPECT_EQ(GetVarint32Ptr(over.data(), over.data() + over.size(), &v), nullptr);
+  EXPECT_EQ(GetVarint32Ptr(over.data(), over.data() + over.size(), &v),
+            nullptr);
 
   const std::string toolong = Bytes({0x80, 0x80, 0x80, 0x80, 0x80, 0x00});
   EXPECT_EQ(GetVarint32Ptr(toolong.data(), toolong.data() + toolong.size(), &v),
@@ -156,7 +157,8 @@ TEST(CodingTest, Varint64OverflowIsRejected) {
   std::uint64_t v = 0;
   std::string over(9, static_cast<char>(0xFF));
   over.push_back(0x02);
-  EXPECT_EQ(GetVarint64Ptr(over.data(), over.data() + over.size(), &v), nullptr);
+  EXPECT_EQ(GetVarint64Ptr(over.data(), over.data() + over.size(), &v),
+            nullptr);
 
   std::string toolong(10, static_cast<char>(0x80));
   toolong.push_back(0x00);

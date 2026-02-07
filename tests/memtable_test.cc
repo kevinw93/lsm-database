@@ -67,10 +67,8 @@ TEST(MemTableTest, IteratesInInternalKeyOrder) {
 
   using T = std::tuple<std::string, SequenceNumber, ValueType, std::string>;
   const std::vector<T> expected = {
-      {"a", 4, ValueType::kValue, "a4"},
-      {"a", 2, ValueType::kValue, "a2"},
-      {"b", 5, ValueType::kDeletion, ""},
-      {"b", 1, ValueType::kValue, "b1"},
+      {"a", 4, ValueType::kValue, "a4"},  {"a", 2, ValueType::kValue, "a2"},
+      {"b", 5, ValueType::kDeletion, ""}, {"b", 1, ValueType::kValue, "b1"},
       {"c", 3, ValueType::kValue, "c3"},
   };
   EXPECT_EQ(Scan(mem), expected);
@@ -109,7 +107,8 @@ TEST(MemTableTest, NeighboringKeysDoNotLeak) {
   mem.Add(2, ValueType::kValue, "c", "vc");
   EXPECT_EQ(GetValue(mem, "b", kMaxSequenceNumber), "<absent>");
   EXPECT_EQ(GetValue(mem, "", kMaxSequenceNumber), "<absent>");
-  EXPECT_EQ(GetValue(mem, std::string_view("a\0", 2), kMaxSequenceNumber), "<absent>");
+  EXPECT_EQ(GetValue(mem, std::string_view("a\0", 2), kMaxSequenceNumber),
+            "<absent>");
 }
 
 TEST(MemTableTest, EmptyAndBinaryKeysAndValues) {
@@ -257,7 +256,8 @@ TEST(MemTableTest, ConcurrentWriterAndReaders) {
     readers.emplace_back([&, r] {
       std::mt19937_64 rng(static_cast<unsigned>(r));
       while (!done.load(std::memory_order_acquire)) {
-        const SequenceNumber visible = published.load(std::memory_order_acquire);
+        const SequenceNumber visible =
+            published.load(std::memory_order_acquire);
 
         if (visible > 0) {
           const SequenceNumber s = rng() % visible + 1;

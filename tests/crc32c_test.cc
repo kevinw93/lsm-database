@@ -15,7 +15,8 @@ TEST(Crc32cTest, Rfc3720Vectors) {
   buf.assign(32, static_cast<char>(0xff));
   EXPECT_EQ(Value(buf), 0x62a8ab43u);
 
-  for (int i = 0; i < 32; ++i) buf[static_cast<std::size_t>(i)] = static_cast<char>(i);
+  for (int i = 0; i < 32; ++i)
+    buf[static_cast<std::size_t>(i)] = static_cast<char>(i);
   EXPECT_EQ(Value(buf), 0x46dd794eu);
 
   for (int i = 0; i < 32; ++i) {

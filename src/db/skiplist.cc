@@ -57,8 +57,8 @@ SkipList::Node* SkipList::NewNode(std::string_view key, std::string_view value,
   static_assert(sizeof(Node) % alignof(std::atomic<Node*>) == 0);
 
   const auto n = static_cast<std::size_t>(height);
-  char* mem = arena_->AllocateAligned(sizeof(Node) +
-                                      n * sizeof(std::atomic<Node*>));
+  char* mem =
+      arena_->AllocateAligned(sizeof(Node) + n * sizeof(std::atomic<Node*>));
   // Value-initialized: every link starts as nullptr.
   auto* links = ::new (mem + sizeof(Node)) std::atomic<Node*>[n]();
   return ::new (mem) Node(key, value, links);

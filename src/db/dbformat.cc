@@ -7,7 +7,8 @@ void AppendInternalKey(std::string* dst, const ParsedInternalKey& key) {
   PutFixed64(dst, PackSequenceAndType(key.sequence, key.type));
 }
 
-std::optional<ParsedInternalKey> ParseInternalKey(std::string_view internal_key) {
+std::optional<ParsedInternalKey> ParseInternalKey(
+    std::string_view internal_key) {
   if (internal_key.size() < kInternalKeyTrailerSize) return std::nullopt;
   const std::uint64_t trailer = ExtractTrailer(internal_key);
   const auto type = static_cast<std::uint8_t>(trailer & 0xFFu);
