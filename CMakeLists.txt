@@ -43,10 +43,17 @@ add_library(lsm
   src/db/skiplist.cc
   src/db/write_batch.cc
   src/status.cc
+  src/table/block.cc
+  src/table/bloom.cc
+  src/table/format.cc
+  src/table/table.cc
+  src/table/table_builder.cc
+  src/table/two_level_iterator.cc
   src/util/coding.cc
   src/util/arena.cc
   src/util/crc32c.cc
   src/util/file.cc
+  src/util/hash.cc
 )
 target_include_directories(lsm
   PUBLIC  ${PROJECT_SOURCE_DIR}/include

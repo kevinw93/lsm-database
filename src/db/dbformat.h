@@ -34,6 +34,10 @@ inline constexpr SequenceNumber kMaxSequenceNumber =
 
 inline constexpr std::size_t kInternalKeyTrailerSize = 8;
 
+// Result of looking up a user key in one sorted table (memtable or SSTable).
+// kDeleted means a tombstone was found, so older tables must not be consulted.
+enum class LookupResult { kNotPresent, kFound, kDeleted };
+
 inline std::uint64_t PackSequenceAndType(SequenceNumber seq, ValueType type) {
   assert(seq <= kMaxSequenceNumber);
   return (seq << 8) | static_cast<std::uint8_t>(type);

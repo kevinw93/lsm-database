@@ -7,26 +7,9 @@
 #include "db/write_batch_internal.h"
 #include "lsm/write_batch.h"
 #include "util/coding.h"
+#include "util/error_iterator.h"
 
 namespace lsm {
-namespace {
-
-class ErrorIterator final : public Iterator {
- public:
-  explicit ErrorIterator(Status s) : status_(std::move(s)) {}
-  bool Valid() const override { return false; }
-  void SeekToFirst() override {}
-  void Seek(std::string_view) override {}
-  void Next() override {}
-  std::string_view key() const override { return {}; }
-  std::string_view value() const override { return {}; }
-  Status status() const override { return status_; }
-
- private:
-  Status status_;
-};
-
-}  // namespace
 
 Status DB::Open(std::string_view path, const Options& options,
                 std::unique_ptr<DB>* db) {
@@ -189,7 +172,7 @@ Status DBImpl::Get(const ReadOptions& options, std::string_view key,
 }
 
 std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions&) {
-  return std::make_unique<ErrorIterator>(Status::NotSupported("iterators"));
+  return NewErrorIterator(Status::NotSupported("iterators"));
 }
 
 const Snapshot* DBImpl::GetSnapshot() { return nullptr; }

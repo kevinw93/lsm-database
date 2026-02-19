@@ -95,6 +95,40 @@ Status WritableFile::Close() {
   return s;
 }
 
+Status RandomAccessFile::Open(const std::string& path,
+                              std::unique_ptr<RandomAccessFile>* result) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return PosixError(path, errno);
+  result->reset(new RandomAccessFile(fd, path));
+  return Status::OK();
+}
+
+RandomAccessFile::~RandomAccessFile() { ::close(fd_); }
+
+Status RandomAccessFile::Read(std::uint64_t offset, std::size_t n,
+                              std::string* result) const {
+  result->resize(n);
+  std::size_t done = 0;
+  while (done < n) {
+    const ssize_t r = ::pread(fd_, result->data() + done, n - done,
+                              static_cast<off_t>(offset + done));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return PosixError(path_, errno);
+    }
+    if (r == 0) return Status::Corruption(path_, "read past end of file");
+    done += static_cast<std::size_t>(r);
+  }
+  return Status::OK();
+}
+
+Status GetFileSize(const std::string& path, std::uint64_t* size) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return PosixError(path, errno);
+  *size = static_cast<std::uint64_t>(st.st_size);
+  return Status::OK();
+}
+
 Status ReadFileToString(const std::string& path, std::string* data) {
   data->clear();
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);

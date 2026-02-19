@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "lsm/status.h"
@@ -40,6 +42,27 @@ class WritableFile {
   std::unique_ptr<char[]> buf_;
   std::size_t buf_used_ = 0;
 };
+
+// Positional reads from an immutable file. Thread-safe.
+class RandomAccessFile {
+ public:
+  static Status Open(const std::string& path,
+                     std::unique_ptr<RandomAccessFile>* result);
+  ~RandomAccessFile();
+  RandomAccessFile(const RandomAccessFile&) = delete;
+  RandomAccessFile& operator=(const RandomAccessFile&) = delete;
+
+  // Reads exactly n bytes at offset. Corruption if the file is shorter.
+  Status Read(std::uint64_t offset, std::size_t n, std::string* result) const;
+
+ private:
+  RandomAccessFile(int fd, std::string path)
+      : fd_(fd), path_(std::move(path)) {}
+  const int fd_;
+  const std::string path_;
+};
+
+Status GetFileSize(const std::string& path, std::uint64_t* size);
 
 Status ReadFileToString(const std::string& path, std::string* data);
 

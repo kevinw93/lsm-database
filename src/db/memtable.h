@@ -24,11 +24,10 @@ class MemTable {
   void Add(SequenceNumber seq, ValueType type, std::string_view user_key,
            std::string_view value);
 
-  enum class GetResult { kNotPresent, kFound, kDeleted };
+  using GetResult = LookupResult;
 
-  // Looks up the newest entry for user_key with sequence <= seq. kDeleted
-  // means a tombstone was found, so older data in other tables must be
-  // ignored. *value is set only for kFound.
+  // Looks up the newest entry for user_key with sequence <= seq. *value is
+  // set only for kFound.
   GetResult Get(std::string_view user_key, SequenceNumber seq,
                 std::string* value) const;
 
