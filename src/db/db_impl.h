@@ -1,22 +1,28 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "db/dbformat.h"
 #include "db/log.h"
 #include "db/memtable.h"
+#include "db/version.h"
 #include "lsm/db.h"
 #include "util/file.h"
 
 namespace lsm {
 
-// Writes are serialized by mutex_ and go WAL first, then memtable. Reads take
-// no lock: they read last_sequence_ and search the memtable concurrently with
-// the writer.
+// Locking:
+//   write_mutex_  serializes writers; held across WAL I/O.
+//   mutex_        guards the pointers readers copy (mem_, imm_, version_) and
+//                 the background state. Held only briefly, never across I/O.
+// Lock order is write_mutex_ then mutex_. The background thread takes only
+// mutex_, so it can always make progress while a writer is stalled.
 class DBImpl final : public DB {
  public:
   DBImpl(std::string path, const Options& options);
@@ -36,26 +42,48 @@ class DBImpl final : public DB {
   void ReleaseSnapshot(const Snapshot* snapshot) override;
 
  private:
-  Status ReplayLogFile(std::uint64_t number);
+  Status ReplayLogFile(std::uint64_t number, SequenceNumber* last);
   Status NewLogFile(std::uint64_t number);
+  Status MakeRoomForWrite();
+  void BackgroundLoop();
+  Status FlushImmutable(std::unique_lock<std::mutex>& lock);
+  Status BuildTable(const MemTable& mem, std::uint64_t number, FileMeta* meta);
+  Status OpenTable(std::uint64_t number, std::uint64_t size,
+                   std::shared_ptr<Table>* table);
+  void RemoveObsoleteFiles(std::uint64_t log_number, const Version& live);
 
   const std::string path_;
   const Options options_;
 
-  // Declared before log_ so the log is closed before the lock is released.
+  // Declared first so it is released last.
   std::unique_ptr<FileLock> lock_;
 
-  std::mutex mutex_;
-  std::unique_ptr<log::Writer> log_;  // guarded by mutex_
-  // First WAL failure. Once set, every later write fails with it, because the
-  // log may end in a partial record that would hide later records on recovery.
-  Status write_error_;   // guarded by mutex_
-  std::string scratch_;  // guarded by mutex_
+  std::mutex write_mutex_;
+  std::unique_ptr<log::Writer> log_;  // guarded by write_mutex_
+  // First WAL failure; later writes fail with it (see A3 notes).
+  Status write_error_;   // guarded by write_mutex_
+  std::string scratch_;  // guarded by write_mutex_
 
-  MemTable mem_;  // writes under mutex_; reads lock-free
-  // Highest sequence number whose batch is fully in mem_. Released after the
-  // memtable insert, so readers never see part of a batch.
+  std::mutex mutex_;
+  // Signaled when imm_ is set or cleared, on background error, and on
+  // shutdown.
+  std::condition_variable cv_;
+  // mem_ is replaced while holding both mutexes, so either one suffices to
+  // read it. The memtable's contents are written only by the writer.
+  std::shared_ptr<MemTable> mem_;
+  std::shared_ptr<MemTable> imm_;           // guarded by mutex_
+  std::shared_ptr<const Version> version_;  // guarded by mutex_
+  SequenceNumber imm_last_sequence_ = 0;    // guarded by mutex_
+  std::uint64_t mem_log_number_ = 0;        // guarded by mutex_
+  Status bg_error_;                         // guarded by mutex_
+  bool shutting_down_ = false;              // guarded by mutex_
+
+  std::atomic<std::uint64_t> next_file_number_{1};
+  // Highest sequence number whose batch is fully in mem_. Published after
+  // the memtable insert, so readers never see part of a batch.
   std::atomic<SequenceNumber> last_sequence_{0};
+
+  std::thread bg_thread_;  // declared last: started after everything above
 };
 
 }  // namespace lsm

@@ -36,6 +36,11 @@ class MemTable {
   std::unique_ptr<Iterator> NewIterator() const;
 
   std::size_t ApproximateMemoryUsage() const { return arena_.MemoryUsage(); }
+  bool Empty() const {
+    SkipList::Iterator it(&table_);
+    it.SeekToFirst();
+    return !it.Valid();
+  }
 
  private:
   Arena arena_;

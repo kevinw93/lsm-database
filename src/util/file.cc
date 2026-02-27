@@ -171,6 +171,20 @@ bool DirExists(const std::string& path) {
   return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+bool FileExists(const std::string& path) {
+  return ::access(path.c_str(), F_OK) == 0;
+}
+
+Status RemoveFile(const std::string& path) {
+  if (::unlink(path.c_str()) != 0) return PosixError(path, errno);
+  return Status::OK();
+}
+
+Status RenameFile(const std::string& from, const std::string& to) {
+  if (::rename(from.c_str(), to.c_str()) != 0) return PosixError(from, errno);
+  return Status::OK();
+}
+
 Status ListDir(const std::string& path, std::vector<std::string>* names) {
   names->clear();
   std::error_code ec;

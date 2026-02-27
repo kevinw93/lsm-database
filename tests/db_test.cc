@@ -14,6 +14,7 @@
 #include "db/filename.h"
 #include "lsm/write_batch.h"
 #include "test_util.h"
+#include "util/file.h"
 
 namespace lsm {
 namespace {
@@ -47,16 +48,25 @@ class DBTest : public ::testing::Test {
     return value;
   }
 
-  std::vector<std::string> LogFiles() {
-    std::vector<std::string> logs;
+  std::vector<std::string> Files(FileType want) {
+    std::vector<std::string> out;
     for (const auto& entry : std::filesystem::directory_iterator(dir_.path())) {
       std::uint64_t number;
-      if (ParseLogFileName(entry.path().filename().string(), &number)) {
-        logs.push_back(entry.path().string());
+      FileType type;
+      if (ParseFileName(entry.path().filename().string(), &number, &type) &&
+          type == want) {
+        out.push_back(entry.path().string());
       }
     }
-    std::sort(logs.begin(), logs.end());
-    return logs;
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+  std::vector<std::string> LogFiles() { return Files(FileType::kLog); }
+
+  static Options SmallBufferOptions() {
+    Options options = DefaultOptions();
+    options.write_buffer_size = 32 * 1024;  // flush every ~250 writes below
+    return options;
   }
 
   test::TempDir dir_;
@@ -217,7 +227,8 @@ TEST_F(DBTest, UnimplementedFeaturesSayNotSupported) {
   EXPECT_TRUE(it->status().IsNotSupported());
 }
 
-TEST_F(DBTest, ConcurrentWritersAndReaders) {
+TEST_F(DBTest, ConcurrentWritersAndReadersWithFlushes) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
   constexpr int kWriters = 4;
   constexpr int kReaders = 4;
   constexpr int kWritesPerThread = 1500;
@@ -270,12 +281,80 @@ TEST_F(DBTest, ConcurrentWritersAndReaders) {
   for (auto& t : readers) t.join();
   EXPECT_EQ(failures.load(), 0);
 
+  EXPECT_FALSE(Files(FileType::kTable).empty());
+
   ASSERT_TRUE(Reopen().ok());
   for (int w = 0; w < kWriters; ++w) {
     EXPECT_EQ(Get("latest" + std::to_string(w)),
               std::to_string(kWritesPerThread - 1));
     EXPECT_EQ(Get("w" + std::to_string(w) + "_0"), "0");
   }
+}
+
+TEST_F(DBTest, FlushedDataSurvivesReopen) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  const std::string value(100, 'v');
+  for (int i = 0; i < 3000; ++i) {
+    ASSERT_TRUE(Put("key" + std::to_string(i), value + std::to_string(i)).ok());
+  }
+  for (int i = 0; i < 3000; i += 3) {
+    ASSERT_TRUE(db_->Delete(WriteOptions(), "key" + std::to_string(i)).ok());
+  }
+  ASSERT_TRUE(Put("key1", "overwritten").ok());
+
+  auto check = [&] {
+    for (int i = 0; i < 3000; ++i) {
+      const std::string expected = i % 3 == 0 ? "NOT_FOUND"
+                                   : i == 1   ? "overwritten"
+                                              : value + std::to_string(i);
+      ASSERT_EQ(Get("key" + std::to_string(i)), expected) << i;
+    }
+  };
+  check();
+  db_.reset();
+  EXPECT_GT(Files(FileType::kTable).size(), 5u);
+  EXPECT_LE(LogFiles().size(), 2u);  // flushed WALs were deleted
+
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  check();
+}
+
+TEST_F(DBTest, RecoveryIgnoresLeftoversOfACrashMidFlush) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_TRUE(Put("key" + std::to_string(i), std::string(100, 'x')).ok());
+  }
+  db_.reset();
+
+  auto write_garbage = [&](const std::string& name) {
+    std::unique_ptr<WritableFile> f;
+    ASSERT_TRUE(WritableFile::Open(dir_.path() + "/" + name, &f).ok());
+    ASSERT_TRUE(f->Append("garbage that is not a valid file").ok());
+    ASSERT_TRUE(f->Close().ok());
+  };
+  // A table written but never committed to the manifest, a half-written
+  // manifest, and an old WAL the last manifest already marked obsolete. If
+  // recovery trusted any of them it would fail or return wrong data.
+  write_garbage("999999.sst");
+  write_garbage("MANIFEST.tmp");
+  write_garbage("000000.log");
+
+  ASSERT_TRUE(Reopen().ok());
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), std::string(100, 'x'));
+  }
+  EXPECT_FALSE(std::filesystem::exists(dir_.path() + "/999999.sst"));
+  EXPECT_FALSE(std::filesystem::exists(dir_.path() + "/MANIFEST.tmp"));
+  EXPECT_FALSE(std::filesystem::exists(dir_.path() + "/000000.log"));
+}
+
+TEST_F(DBTest, CorruptManifestFailsOpen) {
+  db_.reset();
+  std::unique_ptr<WritableFile> f;
+  ASSERT_TRUE(WritableFile::Open(dir_.path() + "/MANIFEST", &f).ok());
+  ASSERT_TRUE(f->Append("not a manifest").ok());
+  ASSERT_TRUE(f->Close().ok());
+  EXPECT_TRUE(Reopen().IsCorruption());
 }
 
 }  // namespace

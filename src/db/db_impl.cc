@@ -6,6 +6,7 @@
 #include "db/filename.h"
 #include "db/write_batch_internal.h"
 #include "lsm/write_batch.h"
+#include "table/table_builder.h"
 #include "util/coding.h"
 #include "util/error_iterator.h"
 
@@ -21,9 +22,19 @@ Status DB::Open(std::string_view path, const Options& options,
 }
 
 DBImpl::DBImpl(std::string path, const Options& options)
-    : path_(std::move(path)), options_(options) {}
+    : path_(std::move(path)),
+      options_(options),
+      mem_(std::make_shared<MemTable>()),
+      version_(std::make_shared<Version>()) {}
 
 DBImpl::~DBImpl() {
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    shutting_down_ = true;
+  }
+  cv_.notify_all();
+  if (bg_thread_.joinable()) bg_thread_.join();
+  // An unflushed imm_ is still covered by its WAL, so nothing is lost.
   if (log_) static_cast<void>(log_->Close());
 }
 
@@ -38,34 +49,69 @@ Status DBImpl::Recover() {
   Status s = FileLock::Acquire(LockFileName(path_), &lock_);
   if (!s.ok()) return s;
 
+  ManifestState state;
+  if (FileExists(ManifestFileName(path_))) {
+    if (options_.error_if_exists) {
+      return Status::InvalidArgument(path_, "exists");
+    }
+    s = ReadManifest(path_, &state);
+    if (!s.ok()) return s;
+  } else {
+    if (!options_.create_if_missing) {
+      return Status::InvalidArgument(path_, "does not exist");
+    }
+    // Written before the first log, so a log never exists without a manifest.
+    s = WriteManifest(path_, state);
+    if (!s.ok()) return s;
+  }
+
+  auto version = std::make_shared<Version>(state.version);
+  for (auto& level : version->levels) {
+    for (FileMeta& f : level) {
+      s = OpenTable(f.number, f.size, &f.table);
+      if (!s.ok()) return s;
+    }
+  }
+
   std::vector<std::string> names;
   s = ListDir(path_, &names);
   if (!s.ok()) return s;
   std::vector<std::uint64_t> logs;
+  std::uint64_t next_number = state.next_file_number;
   for (const auto& name : names) {
     std::uint64_t number;
-    if (ParseLogFileName(name, &number)) logs.push_back(number);
+    FileType type;
+    if (!ParseFileName(name, &number, &type)) continue;
+    next_number = std::max(next_number, number + 1);
+    if (type == FileType::kLog && number >= state.log_number) {
+      logs.push_back(number);
+    }
   }
   std::sort(logs.begin(), logs.end());
 
-  if (logs.empty() && !options_.create_if_missing) {
-    return Status::InvalidArgument(path_, "does not exist");
-  }
-  if (!logs.empty() && options_.error_if_exists) {
-    return Status::InvalidArgument(path_, "exists");
-  }
-
+  SequenceNumber last = state.last_sequence;
   for (std::uint64_t number : logs) {
-    s = ReplayLogFile(number);
+    s = ReplayLogFile(number, &last);
     if (!s.ok()) return s;
   }
+  last_sequence_.store(last, std::memory_order_relaxed);
+  next_file_number_.store(next_number, std::memory_order_relaxed);
+  version_ = version;
+  RemoveObsoleteFiles(state.log_number, *version);
 
   // Never append to a replayed log: its tail may be a torn record, and
   // anything written after it would be unreachable on the next recovery.
-  return NewLogFile(logs.empty() ? 1 : logs.back() + 1);
+  // mem_ now spans the replayed logs and this new one; once mem_ is flushed,
+  // all of them are obsolete.
+  mem_log_number_ = next_file_number_.fetch_add(1);
+  s = NewLogFile(mem_log_number_);
+  if (!s.ok()) return s;
+
+  bg_thread_ = std::thread([this] { BackgroundLoop(); });
+  return Status::OK();
 }
 
-Status DBImpl::ReplayLogFile(std::uint64_t number) {
+Status DBImpl::ReplayLogFile(std::uint64_t number, SequenceNumber* last) {
   const std::string fname = LogFileName(path_, number);
   std::string contents;
   Status s = ReadFileToString(fname, &contents);
@@ -73,29 +119,28 @@ Status DBImpl::ReplayLogFile(std::uint64_t number) {
 
   log::Reader reader(contents);
   std::string_view record;
-  SequenceNumber last = last_sequence_.load(std::memory_order_relaxed);
   while (reader.ReadRecord(&record)) {
     // A record that passed its CRC but doesn't parse was written that way:
     // a bug, not a torn write. Refuse to open rather than guess.
-    if (record.size() < 8)
+    if (record.size() < 8) {
       return Status::Corruption(fname, "log record too short");
+    }
     const SequenceNumber first = DecodeFixed64(record.data());
     const std::string_view rep = record.substr(8);
     std::uint32_t count = 0;
     s = WriteBatchInternal::Validate(rep, &count);
     if (!s.ok()) return Status::Corruption(fname, s.message());
-    // Batches are logged with contiguous sequence numbers, across log files
-    // too: each new log continues from the last record recovered. A gap means
-    // records that an earlier recovery saw are now unreadable.
-    if (first != last + 1 || count == 0 ||
+    // Sequence numbers are contiguous from the tables through every log:
+    // each log continues from the last record recovered. A gap means records
+    // a previous recovery saw are now unreadable.
+    if (first != *last + 1 || count == 0 ||
         first + count - 1 > kMaxSequenceNumber) {
       return Status::Corruption(fname, "non-contiguous sequence number in log");
     }
-    s = WriteBatchInternal::InsertInto(rep, first, &mem_);
+    s = WriteBatchInternal::InsertInto(rep, first, mem_.get());
     if (!s.ok()) return s;
-    last = first + count - 1;
+    *last = first + count - 1;
   }
-  last_sequence_.store(last, std::memory_order_relaxed);
   return Status::OK();
 }
 
@@ -124,12 +169,46 @@ Status DBImpl::Delete(const WriteOptions& options, std::string_view key) {
   return Write(options, batch);
 }
 
+// REQUIRES: write_mutex_ held.
+Status DBImpl::MakeRoomForWrite() {
+  std::unique_lock<std::mutex> l(mutex_);
+  while (true) {
+    if (!bg_error_.ok()) return bg_error_;
+    if (mem_->Empty() ||
+        mem_->ApproximateMemoryUsage() < options_.write_buffer_size) {
+      return Status::OK();
+    }
+    if (imm_ != nullptr) {
+      cv_.wait(l);  // write stall: the previous memtable is still flushing
+      continue;
+    }
+    // Only writers touch log_, and we hold write_mutex_, so the new log is
+    // created without holding mutex_ and readers are not blocked on its I/O.
+    l.unlock();
+    const std::uint64_t log_number = next_file_number_.fetch_add(1);
+    static_cast<void>(log_->Close());  // every record was already flushed
+    Status s = NewLogFile(log_number);
+    l.lock();
+    if (!s.ok()) return s;
+    imm_ = std::move(mem_);
+    mem_ = std::make_shared<MemTable>();
+    imm_last_sequence_ = last_sequence_.load(std::memory_order_relaxed);
+    mem_log_number_ = log_number;
+    cv_.notify_all();
+  }
+}
+
 Status DBImpl::Write(const WriteOptions& options, const WriteBatch& batch) {
   const std::uint32_t count = batch.Count();
   if (count == 0) return Status::OK();
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(write_mutex_);
   if (!write_error_.ok()) return write_error_;
+  Status s = MakeRoomForWrite();
+  if (!s.ok()) {
+    write_error_ = s;
+    return s;
+  }
 
   const SequenceNumber first =
       last_sequence_.load(std::memory_order_relaxed) + 1;
@@ -142,16 +221,10 @@ Status DBImpl::Write(const WriteOptions& options, const WriteBatch& batch) {
   PutFixed64(&scratch_, first);
   scratch_.append(rep);
 
-  Status s = log_->AddRecord(scratch_);
+  s = log_->AddRecord(scratch_);
   if (s.ok()) s = options.sync ? log_->Sync() : log_->Flush();
+  if (s.ok()) s = WriteBatchInternal::InsertInto(rep, first, mem_.get());
   if (!s.ok()) {
-    write_error_ = s;
-    return s;
-  }
-
-  s = WriteBatchInternal::InsertInto(rep, first, &mem_);
-  if (!s.ok()) {
-    // Unreachable for batches built through the WriteBatch API.
     write_error_ = s;
     return s;
   }
@@ -159,15 +232,168 @@ Status DBImpl::Write(const WriteOptions& options, const WriteBatch& batch) {
   return Status::OK();
 }
 
+void DBImpl::BackgroundLoop() {
+  std::unique_lock<std::mutex> l(mutex_);
+  while (true) {
+    cv_.wait(l, [this] {
+      return shutting_down_ || (imm_ != nullptr && bg_error_.ok());
+    });
+    if (shutting_down_) return;
+    Status s = FlushImmutable(l);
+    if (!s.ok()) bg_error_ = s;
+    cv_.notify_all();
+  }
+}
+
+// REQUIRES: mutex_ held via lock; released during I/O. Only this thread
+// changes version_, so the next Version can be built from it unlocked.
+Status DBImpl::FlushImmutable(std::unique_lock<std::mutex>& lock) {
+  const std::shared_ptr<MemTable> imm = imm_;
+  ManifestState state;
+  state.version = *version_;
+  state.log_number = mem_log_number_;
+  state.last_sequence = imm_last_sequence_;
+  lock.unlock();
+
+  const std::uint64_t number = next_file_number_.fetch_add(1);
+  FileMeta meta;
+  Status s = BuildTable(*imm, number, &meta);
+  if (s.ok()) {
+    auto& l0 = state.version.levels[0];
+    l0.insert(l0.begin(), std::move(meta));
+    state.next_file_number = next_file_number_.load();
+    // Commit point: once the manifest is renamed into place, the table is
+    // live and the WALs below log_number are garbage.
+    s = WriteManifest(path_, state);
+  }
+  if (!s.ok()) {
+    static_cast<void>(RemoveFile(TableFileName(path_, number)));
+    lock.lock();
+    return s;
+  }
+
+  auto next = std::make_shared<const Version>(std::move(state.version));
+  lock.lock();
+  version_ = next;
+  imm_.reset();  // readers that copied it keep it alive
+  lock.unlock();
+  RemoveObsoleteFiles(state.log_number, *next);
+  lock.lock();
+  return Status::OK();
+}
+
+Status DBImpl::OpenTable(std::uint64_t number, std::uint64_t size,
+                         std::shared_ptr<Table>* table) {
+  std::unique_ptr<RandomAccessFile> file;
+  Status s = RandomAccessFile::Open(TableFileName(path_, number), &file);
+  std::unique_ptr<Table> opened;
+  if (s.ok()) s = Table::Open(std::move(file), size, &opened);
+  if (s.ok()) *table = std::move(opened);
+  return s;
+}
+
+Status DBImpl::BuildTable(const MemTable& mem, std::uint64_t number,
+                          FileMeta* meta) {
+  const std::string fname = TableFileName(path_, number);
+  std::unique_ptr<WritableFile> file;
+  Status s = WritableFile::Open(fname, &file);
+  if (!s.ok()) return s;
+
+  TableBuilder builder(TableOptions(), file.get());
+  auto it = mem.NewIterator();
+  it->SeekToFirst();
+  meta->smallest.assign(it->key());  // imm is never empty
+  for (; it->Valid(); it->Next()) {
+    meta->largest.assign(it->key());
+    builder.Add(it->key(), it->value());
+  }
+  s = builder.Finish();
+  if (s.ok()) s = file->Sync();
+  if (s.ok()) s = file->Close();
+  if (!s.ok()) return s;
+
+  meta->number = number;
+  meta->size = builder.FileSize();
+  return OpenTable(number, meta->size, &meta->table);
+}
+
+// Deletes WALs below log_number, tables not in live (left by a crash between
+// writing a table and committing the manifest), and a stale MANIFEST.tmp.
+// Called only from Recover and the background thread, so no table is being
+// built concurrently.
+void DBImpl::RemoveObsoleteFiles(std::uint64_t log_number,
+                                 const Version& live) {
+  std::vector<std::string> names;
+  if (!ListDir(path_, &names).ok()) return;
+  for (const auto& name : names) {
+    std::uint64_t number;
+    FileType type;
+    bool obsolete = name == "MANIFEST.tmp";
+    if (ParseFileName(name, &number, &type)) {
+      if (type == FileType::kLog) {
+        obsolete = number < log_number;
+      } else {
+        obsolete = true;
+        for (const auto& level : live.levels) {
+          for (const FileMeta& f : level) {
+            if (f.number == number) obsolete = false;
+          }
+        }
+      }
+    }
+    if (obsolete) static_cast<void>(RemoveFile(path_ + "/" + name));
+  }
+}
+
+namespace {
+
+// Searches newest data first; the first table that knows about the key
+// (value or tombstone) decides.
+LookupResult SearchVersion(const Version& version, std::string_view key,
+                           SequenceNumber seq, std::string* value, Status* s) {
+  for (const auto& level : version.levels) {
+    for (const FileMeta& f : level) {
+      if (key < ExtractUserKey(f.smallest) || key > ExtractUserKey(f.largest)) {
+        continue;
+      }
+      LookupResult result;
+      *s = f.table->Get(key, seq, value, &result);
+      if (!s->ok() || result != LookupResult::kNotPresent) return result;
+    }
+  }
+  return LookupResult::kNotPresent;
+}
+
+}  // namespace
+
 Status DBImpl::Get(const ReadOptions& options, std::string_view key,
                    std::string* value) {
-  if (options.snapshot != nullptr) {
-    return Status::NotSupported("snapshots");
+  if (options.snapshot != nullptr) return Status::NotSupported("snapshots");
+
+  std::shared_ptr<MemTable> mem;
+  std::shared_ptr<MemTable> imm;
+  std::shared_ptr<const Version> version;
+  SequenceNumber seq;
+  {
+    // Copied together under mutex_, so everything up to seq is in exactly
+    // one of mem, imm, or version.
+    std::lock_guard<std::mutex> l(mutex_);
+    mem = mem_;
+    imm = imm_;
+    version = version_;
+    seq = last_sequence_.load(std::memory_order_acquire);
   }
-  const SequenceNumber seq = last_sequence_.load(std::memory_order_acquire);
-  if (mem_.Get(key, seq, value) == MemTable::GetResult::kFound) {
-    return Status::OK();
+
+  LookupResult result = mem->Get(key, seq, value);
+  if (result == LookupResult::kNotPresent && imm != nullptr) {
+    result = imm->Get(key, seq, value);
   }
+  Status s;
+  if (result == LookupResult::kNotPresent) {
+    result = SearchVersion(*version, key, seq, value, &s);
+  }
+  if (!s.ok()) return s;
+  if (result == LookupResult::kFound) return Status::OK();
   return Status::NotFound(key);
 }
 

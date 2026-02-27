@@ -71,6 +71,10 @@ Status SyncDir(const std::string& path);
 
 Status CreateDirIfMissing(const std::string& path);
 bool DirExists(const std::string& path);
+bool FileExists(const std::string& path);
+Status RemoveFile(const std::string& path);
+// Atomically replaces to, if it exists.
+Status RenameFile(const std::string& from, const std::string& to);
 Status ListDir(const std::string& path, std::vector<std::string>* names);
 
 // Exclusive advisory lock (flock). Held until destroyed. Conflicts with any

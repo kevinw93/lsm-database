@@ -41,6 +41,7 @@ add_library(lsm
   src/db/log.cc
   src/db/memtable.cc
   src/db/skiplist.cc
+  src/db/version.cc
   src/db/write_batch.cc
   src/status.cc
   src/table/block.cc
