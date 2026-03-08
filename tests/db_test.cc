@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -67,6 +68,51 @@ class DBTest : public ::testing::Test {
     Options options = DefaultOptions();
     options.write_buffer_size = 32 * 1024;  // flush every ~250 writes below
     return options;
+  }
+
+  using Model = std::map<std::string, std::string>;
+
+  Model Scan(const Snapshot* snapshot = nullptr) {
+    ReadOptions options;
+    options.snapshot = snapshot;
+    auto it = db_->NewIterator(options);
+    Model out;
+    std::string prev;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      EXPECT_TRUE(out.empty() || std::string(it->key()) > prev);
+      prev.assign(it->key());
+      out.emplace(it->key(), it->value());
+    }
+    EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+    return out;
+  }
+
+  // Get, Scan, and Seek must all agree with model at the given snapshot.
+  void CheckAgainstModel(const Model& model, const Snapshot* snapshot,
+                         int key_space) {
+    ASSERT_EQ(Scan(snapshot), model);
+    ReadOptions options;
+    options.snapshot = snapshot;
+    auto it = db_->NewIterator(options);
+    for (int i = 0; i < key_space; ++i) {
+      const std::string key = "k" + std::to_string(i);
+      std::string value;
+      Status s = db_->Get(options, key, &value);
+      auto m = model.find(key);
+      if (m == model.end()) {
+        ASSERT_TRUE(s.IsNotFound()) << key;
+      } else {
+        ASSERT_TRUE(s.ok()) << key;
+        ASSERT_EQ(value, m->second);
+      }
+      it->Seek(key);
+      auto lb = model.lower_bound(key);
+      ASSERT_EQ(it->Valid(), lb != model.end()) << key;
+      if (it->Valid()) {
+        ASSERT_EQ(it->key(), lb->first);
+        ASSERT_EQ(it->value(), lb->second);
+      }
+    }
   }
 
   test::TempDir dir_;
@@ -221,12 +267,6 @@ TEST_F(DBTest, SecondOpenOfSameDirectoryFails) {
   EXPECT_TRUE(DB::Open(dir_.path(), DefaultOptions(), &second).ok());
 }
 
-TEST_F(DBTest, UnimplementedFeaturesSayNotSupported) {
-  auto it = db_->NewIterator(ReadOptions());
-  EXPECT_FALSE(it->Valid());
-  EXPECT_TRUE(it->status().IsNotSupported());
-}
-
 TEST_F(DBTest, ConcurrentWritersAndReadersWithFlushes) {
   ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
   constexpr int kWriters = 4;
@@ -355,6 +395,99 @@ TEST_F(DBTest, CorruptManifestFailsOpen) {
   ASSERT_TRUE(f->Append("not a manifest").ok());
   ASSERT_TRUE(f->Close().ok());
   EXPECT_TRUE(Reopen().IsCorruption());
+}
+
+TEST_F(DBTest, RandomizedAgainstModelWithSnapshots) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  constexpr int kKeySpace = 300;
+  std::mt19937 rng(42);
+  Model model;
+  std::vector<std::pair<const Snapshot*, Model>> snapshots;
+
+  for (int op = 1; op <= 6000; ++op) {
+    const std::string key = "k" + std::to_string(rng() % kKeySpace);
+    if (rng() % 4 == 0) {
+      ASSERT_TRUE(db_->Delete(WriteOptions(), key).ok());
+      model.erase(key);
+    } else {
+      const std::string value =
+          std::to_string(op) + std::string(rng() % 200, 'v');
+      ASSERT_TRUE(Put(key, value).ok());
+      model[key] = value;
+    }
+    if (op % 1000 == 0) snapshots.emplace_back(db_->GetSnapshot(), model);
+    if (op % 1500 == 0) CheckAgainstModel(model, nullptr, kKeySpace + 10);
+  }
+  ASSERT_FALSE(Files(FileType::kTable).empty());
+
+  for (const auto& [snapshot, snap_model] : snapshots) {
+    CheckAgainstModel(snap_model, snapshot, kKeySpace + 10);
+    db_->ReleaseSnapshot(snapshot);
+  }
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  CheckAgainstModel(model, nullptr, kKeySpace + 10);
+}
+
+TEST_F(DBTest, SnapshotIsolation) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  ASSERT_TRUE(Put("a", "a1").ok());
+  ASSERT_TRUE(Put("b", "b1").ok());
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_TRUE(Put("a", "a2").ok());
+  ASSERT_TRUE(db_->Delete(WriteOptions(), "b").ok());
+  ASSERT_TRUE(Put("c", "c2").ok());
+
+  ReadOptions at_snap;
+  at_snap.snapshot = snap;
+  auto check = [&] {
+    std::string v;
+    ASSERT_TRUE(db_->Get(at_snap, "a", &v).ok());
+    EXPECT_EQ(v, "a1");
+    ASSERT_TRUE(db_->Get(at_snap, "b", &v).ok());
+    EXPECT_EQ(v, "b1");
+    EXPECT_TRUE(db_->Get(at_snap, "c", &v).IsNotFound());
+    EXPECT_EQ(Scan(snap), (Model{{"a", "a1"}, {"b", "b1"}}));
+    EXPECT_EQ(Scan(), (Model{{"a", "a2"}, {"c", "c2"}}));
+  };
+  check();
+  // Push the snapshot's data out of the memtable and into tables.
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_TRUE(Put("z" + std::to_string(i), std::string(100, 'x')).ok());
+  }
+  EXPECT_EQ(Get("a"), "a2");
+  std::string v;
+  ASSERT_TRUE(db_->Get(at_snap, "a", &v).ok());
+  EXPECT_EQ(v, "a1");
+  EXPECT_TRUE(db_->Get(at_snap, "z0", &v).IsNotFound());
+  db_->ReleaseSnapshot(snap);
+}
+
+TEST_F(DBTest, IteratorKeepsItsViewWhileFilesChangeUnderIt) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  Model expected;
+  for (int i = 0; i < 1000; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    ASSERT_TRUE(Put(key, std::string(100, 'a')).ok());
+    expected[key] = std::string(100, 'a');
+  }
+  auto it = db_->NewIterator(ReadOptions());
+  const auto tables = Files(FileType::kTable);
+  ASSERT_FALSE(tables.empty());
+
+  // Later writes, more flushes, and the iterator's own table files unlinked
+  // (as compaction will do): it holds open handles, so its view is intact.
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_TRUE(Put("k" + std::to_string(i), "new").ok());
+    ASSERT_TRUE(db_->Delete(WriteOptions(), "k" + std::to_string(i + 1)).ok());
+  }
+  for (const auto& f : tables) std::filesystem::remove(f);
+
+  Model seen;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    seen.emplace(it->key(), it->value());
+  }
+  EXPECT_TRUE(it->status().ok());
+  EXPECT_EQ(seen, expected);
 }
 
 }  // namespace

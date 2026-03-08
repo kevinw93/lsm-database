@@ -3,12 +3,13 @@
 #include <algorithm>
 #include <vector>
 
+#include "db/db_iter.h"
 #include "db/filename.h"
+#include "db/merging_iterator.h"
 #include "db/write_batch_internal.h"
 #include "lsm/write_batch.h"
 #include "table/table_builder.h"
 #include "util/coding.h"
-#include "util/error_iterator.h"
 
 namespace lsm {
 
@@ -366,43 +367,77 @@ LookupResult SearchVersion(const Version& version, std::string_view key,
 
 }  // namespace
 
+namespace {
+
+struct SnapshotImpl final : Snapshot {
+  SnapshotImpl(SequenceNumber s, std::multiset<SequenceNumber>::iterator p)
+      : seq(s), pos(p) {}
+  const SequenceNumber seq;
+  const std::multiset<SequenceNumber>::iterator pos;
+};
+
+}  // namespace
+
+void DBImpl::CaptureReadState(const ReadOptions& options, ReadState* state,
+                              SequenceNumber* seq) {
+  // Copied together under mutex_; every mem -> imm -> table transition also
+  // happens under mutex_.
+  std::lock_guard<std::mutex> l(mutex_);
+  state->mem = mem_;
+  state->imm = imm_;
+  state->version = version_;
+  *seq = options.snapshot != nullptr
+             ? static_cast<const SnapshotImpl*>(options.snapshot)->seq
+             : last_sequence_.load(std::memory_order_acquire);
+}
+
 Status DBImpl::Get(const ReadOptions& options, std::string_view key,
                    std::string* value) {
-  if (options.snapshot != nullptr) return Status::NotSupported("snapshots");
-
-  std::shared_ptr<MemTable> mem;
-  std::shared_ptr<MemTable> imm;
-  std::shared_ptr<const Version> version;
+  ReadState state;
   SequenceNumber seq;
-  {
-    // Copied together under mutex_, so everything up to seq is in exactly
-    // one of mem, imm, or version.
-    std::lock_guard<std::mutex> l(mutex_);
-    mem = mem_;
-    imm = imm_;
-    version = version_;
-    seq = last_sequence_.load(std::memory_order_acquire);
-  }
+  CaptureReadState(options, &state, &seq);
 
-  LookupResult result = mem->Get(key, seq, value);
-  if (result == LookupResult::kNotPresent && imm != nullptr) {
-    result = imm->Get(key, seq, value);
+  LookupResult result = state.mem->Get(key, seq, value);
+  if (result == LookupResult::kNotPresent && state.imm != nullptr) {
+    result = state.imm->Get(key, seq, value);
   }
   Status s;
   if (result == LookupResult::kNotPresent) {
-    result = SearchVersion(*version, key, seq, value, &s);
+    result = SearchVersion(*state.version, key, seq, value, &s);
   }
   if (!s.ok()) return s;
   if (result == LookupResult::kFound) return Status::OK();
   return Status::NotFound(key);
 }
 
-std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions&) {
-  return NewErrorIterator(Status::NotSupported("iterators"));
+std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) {
+  auto state = std::make_shared<ReadState>();
+  SequenceNumber seq;
+  CaptureReadState(options, state.get(), &seq);
+
+  std::vector<std::unique_ptr<Iterator>> children;
+  children.push_back(state->mem->NewIterator());
+  if (state->imm != nullptr) children.push_back(state->imm->NewIterator());
+  for (const auto& level : state->version->levels) {
+    for (const FileMeta& f : level) children.push_back(f.table->NewIterator());
+  }
+  return NewDBIterator(NewMergingIterator(std::move(children)), seq,
+                       std::move(state));
 }
 
-const Snapshot* DBImpl::GetSnapshot() { return nullptr; }
+const Snapshot* DBImpl::GetSnapshot() {
+  std::lock_guard<std::mutex> l(mutex_);
+  const SequenceNumber seq = last_sequence_.load(std::memory_order_acquire);
+  return new SnapshotImpl(seq, snapshots_.insert(seq));
+}
 
-void DBImpl::ReleaseSnapshot(const Snapshot*) {}
+void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  const auto* s = static_cast<const SnapshotImpl*>(snapshot);
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    snapshots_.erase(s->pos);
+  }
+  delete s;
+}
 
 }  // namespace lsm

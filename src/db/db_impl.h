@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -42,6 +43,16 @@ class DBImpl final : public DB {
   void ReleaseSnapshot(const Snapshot* snapshot) override;
 
  private:
+  // What a read needs; holding it keeps the memtables and tables alive.
+  struct ReadState {
+    std::shared_ptr<MemTable> mem;
+    std::shared_ptr<MemTable> imm;
+    std::shared_ptr<const Version> version;
+  };
+  // Consistent with *seq: every entry up to *seq is in exactly one source.
+  void CaptureReadState(const ReadOptions& options, ReadState* state,
+                        SequenceNumber* seq);
+
   Status ReplayLogFile(std::uint64_t number, SequenceNumber* last);
   Status NewLogFile(std::uint64_t number);
   Status MakeRoomForWrite();
@@ -77,6 +88,8 @@ class DBImpl final : public DB {
   std::uint64_t mem_log_number_ = 0;        // guarded by mutex_
   Status bg_error_;                         // guarded by mutex_
   bool shutting_down_ = false;              // guarded by mutex_
+  // Sequence numbers of live snapshots; compaction keeps what they can see.
+  std::multiset<SequenceNumber> snapshots_;  // guarded by mutex_
 
   std::atomic<std::uint64_t> next_file_number_{1};
   // Highest sequence number whose batch is fully in mem_. Published after
