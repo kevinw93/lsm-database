@@ -32,6 +32,12 @@ class DBImpl final : public DB {
   // Called once by DB::Open before the DB is shared.
   Status Recover();
 
+  // For tests: blocks until no flush or compaction is pending.
+  void TEST_WaitForBackgroundWork();
+  int TEST_NumFiles(int level);
+  // For tests: compacts every level down into the last one.
+  void TEST_CompactAll();
+
   Status Put(const WriteOptions& options, std::string_view key,
              std::string_view value) override;
   Status Delete(const WriteOptions& options, std::string_view key) override;
@@ -43,6 +49,9 @@ class DBImpl final : public DB {
   void ReleaseSnapshot(const Snapshot* snapshot) override;
 
  private:
+  static constexpr std::size_t kL0CompactionTrigger = 4;
+  static constexpr std::size_t kL0StopWritesTrigger = 8;
+
   // What a read needs; holding it keeps the memtables and tables alive.
   struct ReadState {
     std::shared_ptr<MemTable> mem;
@@ -58,6 +67,15 @@ class DBImpl final : public DB {
   Status MakeRoomForWrite();
   void BackgroundLoop();
   Status FlushImmutable(std::unique_lock<std::mutex>& lock);
+  Status CommitVersion(std::unique_lock<std::mutex>& lock, Version next,
+                       std::uint64_t log_number, SequenceNumber last_sequence,
+                       bool clear_imm);
+  int PickCompactionLevel(const Version& v) const;
+  std::uint64_t MaxBytesForLevel(int level) const;
+  std::uint64_t TargetFileSize() const {
+    return 2 * options_.write_buffer_size;
+  }
+  Status Compact(std::unique_lock<std::mutex>& lock, int level);
   Status BuildTable(const MemTable& mem, std::uint64_t number, FileMeta* meta);
   Status OpenTable(std::uint64_t number, std::uint64_t size,
                    std::shared_ptr<Table>* table);
@@ -90,6 +108,12 @@ class DBImpl final : public DB {
   bool shutting_down_ = false;              // guarded by mutex_
   // Sequence numbers of live snapshots; compaction keeps what they can see.
   std::multiset<SequenceNumber> snapshots_;  // guarded by mutex_
+  int forced_level_ = -1;                    // guarded by mutex_; tests only
+
+  // Background thread only (and Recover, before it starts).
+  std::uint64_t persisted_log_number_ = 0;
+  SequenceNumber persisted_last_sequence_ = 0;
+  std::set<std::uint64_t> pending_outputs_;  // tables being written
 
   std::atomic<std::uint64_t> next_file_number_{1};
   // Highest sequence number whose batch is fully in mem_. Published after

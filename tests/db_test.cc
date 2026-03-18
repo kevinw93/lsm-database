@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "db/db_impl.h"
 #include "db/filename.h"
 #include "lsm/write_batch.h"
 #include "test_util.h"
@@ -68,6 +69,16 @@ class DBTest : public ::testing::Test {
     Options options = DefaultOptions();
     options.write_buffer_size = 32 * 1024;  // flush every ~250 writes below
     return options;
+  }
+
+  DBImpl* impl() { return static_cast<DBImpl*>(db_.get()); }
+
+  std::uint64_t TableBytes() {
+    std::uint64_t total = 0;
+    for (const auto& f : Files(FileType::kTable)) {
+      total += std::filesystem::file_size(f);
+    }
+    return total;
   }
 
   using Model = std::map<std::string, std::string>;
@@ -352,7 +363,7 @@ TEST_F(DBTest, FlushedDataSurvivesReopen) {
   };
   check();
   db_.reset();
-  EXPECT_GT(Files(FileType::kTable).size(), 5u);
+  EXPECT_FALSE(Files(FileType::kTable).empty());
   EXPECT_LE(LogFiles().size(), 2u);  // flushed WALs were deleted
 
   ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
@@ -404,7 +415,7 @@ TEST_F(DBTest, RandomizedAgainstModelWithSnapshots) {
   Model model;
   std::vector<std::pair<const Snapshot*, Model>> snapshots;
 
-  for (int op = 1; op <= 6000; ++op) {
+  for (int op = 1; op <= 20000; ++op) {
     const std::string key = "k" + std::to_string(rng() % kKeySpace);
     if (rng() % 4 == 0) {
       ASSERT_TRUE(db_->Delete(WriteOptions(), key).ok());
@@ -415,10 +426,12 @@ TEST_F(DBTest, RandomizedAgainstModelWithSnapshots) {
       ASSERT_TRUE(Put(key, value).ok());
       model[key] = value;
     }
-    if (op % 1000 == 0) snapshots.emplace_back(db_->GetSnapshot(), model);
-    if (op % 1500 == 0) CheckAgainstModel(model, nullptr, kKeySpace + 10);
+    if (op % 4000 == 0) snapshots.emplace_back(db_->GetSnapshot(), model);
+    if (op % 5000 == 0) CheckAgainstModel(model, nullptr, kKeySpace + 10);
   }
-  ASSERT_FALSE(Files(FileType::kTable).empty());
+  impl()->TEST_WaitForBackgroundWork();
+  ASSERT_GT(impl()->TEST_NumFiles(1) + impl()->TEST_NumFiles(2), 0);
+  CheckAgainstModel(model, nullptr, kKeySpace + 10);
 
   for (const auto& [snapshot, snap_model] : snapshots) {
     CheckAgainstModel(snap_model, snapshot, kKeySpace + 10);
@@ -488,6 +501,57 @@ TEST_F(DBTest, IteratorKeepsItsViewWhileFilesChangeUnderIt) {
   }
   EXPECT_TRUE(it->status().ok());
   EXPECT_EQ(seen, expected);
+}
+
+TEST_F(DBTest, CompactionReclaimsSpaceOfDeletedKeys) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  const std::string value(200, 'v');
+  for (int i = 0; i < 3000; ++i) {
+    ASSERT_TRUE(Put("key" + std::to_string(i), value).ok());
+  }
+  impl()->TEST_WaitForBackgroundWork();
+  const std::uint64_t full = TableBytes();
+
+  for (int i = 0; i < 3000; ++i) {
+    if (i % 10 != 0) {
+      ASSERT_TRUE(db_->Delete(WriteOptions(), "key" + std::to_string(i)).ok());
+    }
+  }
+  // Size triggers alone may leave tombstones in a level above the values
+  // they hide; push everything to the last level so they meet.
+  impl()->TEST_CompactAll();
+
+  EXPECT_LT(TableBytes(), full / 3) << "full=" << full;
+  for (int i = 0; i < 3000; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)),
+              i % 10 == 0 ? value : "NOT_FOUND");
+  }
+}
+
+TEST_F(DBTest, SnapshotSurvivesCompaction) {
+  ASSERT_TRUE(Reopen(SmallBufferOptions()).ok());
+  ASSERT_TRUE(Put("k", "old").ok());
+  ASSERT_TRUE(Put("gone", "was-here").ok());
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_TRUE(Put("k", "new").ok());
+  ASSERT_TRUE(db_->Delete(WriteOptions(), "gone").ok());
+  for (int i = 0; i < 5000; ++i) {
+    ASSERT_TRUE(
+        Put("filler" + std::to_string(i % 500), std::string(200, 'x')).ok());
+  }
+  impl()->TEST_WaitForBackgroundWork();
+  ASSERT_GT(impl()->TEST_NumFiles(1) + impl()->TEST_NumFiles(2), 0);
+
+  ReadOptions at_snap;
+  at_snap.snapshot = snap;
+  std::string v;
+  ASSERT_TRUE(db_->Get(at_snap, "k", &v).ok());
+  EXPECT_EQ(v, "old");
+  ASSERT_TRUE(db_->Get(at_snap, "gone", &v).ok());
+  EXPECT_EQ(v, "was-here");
+  EXPECT_EQ(Get("k"), "new");
+  EXPECT_EQ(Get("gone"), "NOT_FOUND");
+  db_->ReleaseSnapshot(snap);
 }
 
 }  // namespace

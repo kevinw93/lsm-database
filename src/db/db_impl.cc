@@ -98,6 +98,8 @@ Status DBImpl::Recover() {
   last_sequence_.store(last, std::memory_order_relaxed);
   next_file_number_.store(next_number, std::memory_order_relaxed);
   version_ = version;
+  persisted_log_number_ = state.log_number;
+  persisted_last_sequence_ = state.last_sequence;
   RemoveObsoleteFiles(state.log_number, *version);
 
   // Never append to a replayed log: its tail may be a torn record, and
@@ -183,6 +185,10 @@ Status DBImpl::MakeRoomForWrite() {
       cv_.wait(l);  // write stall: the previous memtable is still flushing
       continue;
     }
+    if (version_->levels[0].size() >= kL0StopWritesTrigger) {
+      cv_.wait(l);  // write stall: compaction has fallen behind
+      continue;
+    }
     // Only writers touch log_, and we hold write_mutex_, so the new log is
     // created without holding mutex_ and readers are not blocked on its I/O.
     l.unlock();
@@ -237,50 +243,277 @@ void DBImpl::BackgroundLoop() {
   std::unique_lock<std::mutex> l(mutex_);
   while (true) {
     cv_.wait(l, [this] {
-      return shutting_down_ || (imm_ != nullptr && bg_error_.ok());
+      return shutting_down_ ||
+             (bg_error_.ok() &&
+              (imm_ != nullptr || PickCompactionLevel(*version_) >= 0));
     });
     if (shutting_down_) return;
-    Status s = FlushImmutable(l);
+    // Flushes first: a pending imm_ is what stalls writers.
+    Status s = imm_ != nullptr ? FlushImmutable(l)
+                               : Compact(l, PickCompactionLevel(*version_));
     if (!s.ok()) bg_error_ = s;
     cv_.notify_all();
   }
 }
 
-// REQUIRES: mutex_ held via lock; released during I/O. Only this thread
-// changes version_, so the next Version can be built from it unlocked.
+// REQUIRES: lock held; released during I/O, held on return. Only the
+// background thread changes version_, so next can be built from it unlocked.
+Status DBImpl::CommitVersion(std::unique_lock<std::mutex>& lock, Version next,
+                             std::uint64_t log_number,
+                             SequenceNumber last_sequence, bool clear_imm) {
+  ManifestState state;
+  state.next_file_number = next_file_number_.load();
+  state.log_number = log_number;
+  state.last_sequence = last_sequence;
+  state.version = std::move(next);
+  lock.unlock();
+  // Commit point: once the manifest is renamed into place, the new files are
+  // live and the old ones (and WALs below log_number) are garbage.
+  Status s = WriteManifest(path_, state);
+  auto installed = std::make_shared<const Version>(std::move(state.version));
+  lock.lock();
+  if (!s.ok()) return s;
+  version_ = installed;
+  // Same critical section as the version swap, so a reader never sees the
+  // flushed data in both imm_ and a table, or in neither.
+  if (clear_imm) imm_.reset();
+  persisted_log_number_ = log_number;
+  persisted_last_sequence_ = last_sequence;
+  lock.unlock();
+  RemoveObsoleteFiles(log_number, *installed);
+  lock.lock();
+  return Status::OK();
+}
+
 Status DBImpl::FlushImmutable(std::unique_lock<std::mutex>& lock) {
   const std::shared_ptr<MemTable> imm = imm_;
-  ManifestState state;
-  state.version = *version_;
-  state.log_number = mem_log_number_;
-  state.last_sequence = imm_last_sequence_;
+  Version next = *version_;
+  const std::uint64_t log_number = mem_log_number_;
+  const SequenceNumber last_sequence = imm_last_sequence_;
   lock.unlock();
 
   const std::uint64_t number = next_file_number_.fetch_add(1);
+  pending_outputs_.insert(number);
   FileMeta meta;
   Status s = BuildTable(*imm, number, &meta);
+  lock.lock();
   if (s.ok()) {
-    auto& l0 = state.version.levels[0];
-    l0.insert(l0.begin(), std::move(meta));
-    state.next_file_number = next_file_number_.load();
-    // Commit point: once the manifest is renamed into place, the table is
-    // live and the WALs below log_number are garbage.
-    s = WriteManifest(path_, state);
+    next.levels[0].insert(next.levels[0].begin(), std::move(meta));
+    s = CommitVersion(lock, std::move(next), log_number, last_sequence,
+                      /*clear_imm=*/true);
   }
-  if (!s.ok()) {
-    static_cast<void>(RemoveFile(TableFileName(path_, number)));
-    lock.lock();
-    return s;
-  }
+  pending_outputs_.erase(number);
+  if (!s.ok()) static_cast<void>(RemoveFile(TableFileName(path_, number)));
+  return s;
+}
 
-  auto next = std::make_shared<const Version>(std::move(state.version));
-  lock.lock();
-  version_ = next;
-  imm_.reset();  // readers that copied it keep it alive
+std::uint64_t DBImpl::MaxBytesForLevel(int level) const {
+  std::uint64_t bytes = 4 * options_.write_buffer_size;  // level 1
+  for (int l = 1; l < level; ++l) bytes *= 10;
+  return bytes;
+}
+
+int DBImpl::PickCompactionLevel(const Version& v) const {
+  if (forced_level_ >= 0 && !v.levels[forced_level_].empty()) {
+    return forced_level_;
+  }
+  if (v.levels[0].size() >= kL0CompactionTrigger) return 0;
+  int best = -1;
+  double best_score = 1.0;
+  for (int level = 1; level + 1 < kNumLevels;
+       ++level) {  // last level: no limit
+    std::uint64_t bytes = 0;
+    for (const FileMeta& f : v.levels[level]) bytes += f.size;
+    const double score = static_cast<double>(bytes) /
+                         static_cast<double>(MaxBytesForLevel(level));
+    if (score >= best_score) {
+      best_score = score;
+      best = level;
+    }
+  }
+  return best;
+}
+
+namespace {
+
+bool Overlaps(const FileMeta& f, std::string_view lo, std::string_view hi) {
+  return !(ExtractUserKey(f.largest) < lo || ExtractUserKey(f.smallest) > hi);
+}
+
+// True if no level below out_level can hold user_key, so a tombstone for it
+// has nothing left to hide.
+bool IsBaseLevelForKey(const Version& v, int out_level,
+                       std::string_view user_key) {
+  for (int level = out_level + 1; level < kNumLevels; ++level) {
+    for (const FileMeta& f : v.levels[level]) {
+      if (Overlaps(f, user_key, user_key)) return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+// Merges all of `level` with the overlapping files of level + 1.
+Status DBImpl::Compact(std::unique_lock<std::mutex>& lock, int level) {
+  const std::shared_ptr<const Version> base = version_;
+  // Versions newer than this may be dropped only if no snapshot can see them.
+  const SequenceNumber oldest_snapshot =
+      snapshots_.empty() ? last_sequence_.load(std::memory_order_acquire)
+                         : *snapshots_.begin();
   lock.unlock();
-  RemoveObsoleteFiles(state.log_number, *next);
+
+  const int out_level = level + 1;
+  std::vector<const FileMeta*> inputs;
+  std::string lo;
+  std::string hi;
+  for (const FileMeta& f : base->levels[level]) {
+    if (inputs.empty() || ExtractUserKey(f.smallest) < lo) {
+      lo.assign(ExtractUserKey(f.smallest));
+    }
+    if (inputs.empty() || ExtractUserKey(f.largest) > hi) {
+      hi.assign(ExtractUserKey(f.largest));
+    }
+    inputs.push_back(&f);
+  }
+  for (const FileMeta& f : base->levels[out_level]) {
+    if (Overlaps(f, lo, hi)) inputs.push_back(&f);
+  }
+  std::vector<std::unique_ptr<Iterator>> children;
+  for (const FileMeta* f : inputs) children.push_back(f->table->NewIterator());
+  auto merged = NewMergingIterator(std::move(children));
+
+  std::vector<FileMeta> outputs;
+  std::unique_ptr<WritableFile> file;
+  std::unique_ptr<TableBuilder> builder;
+  auto finish_output = [&]() -> Status {
+    Status st = builder->Finish();
+    if (st.ok()) st = file->Sync();
+    if (st.ok()) st = file->Close();
+    FileMeta& out = outputs.back();
+    out.size = builder->FileSize();
+    if (st.ok()) st = OpenTable(out.number, out.size, &out.table);
+    builder.reset();
+    file.reset();
+    return st;
+  };
+
+  Status s;
+  bool aborted = false;
+  std::string current_key;
+  bool has_key = false;
+  SequenceNumber last_seq_for_key = 0;
+  for (merged->SeekToFirst(); merged->Valid(); merged->Next()) {
+    const auto e = ParseInternalKey(merged->key());
+    if (!e) {
+      s = Status::Corruption("bad internal key during compaction");
+      break;
+    }
+    const bool new_key = !has_key || e->user_key != current_key;
+    if (new_key) {
+      // Cut outputs only between user keys, so one key's versions never span
+      // two files of a level.
+      if (builder != nullptr && builder->FileSize() >= TargetFileSize()) {
+        s = finish_output();
+        if (!s.ok()) break;
+        // Between outputs: honor shutdown, and let a waiting flush run so
+        // writers aren't stalled for the whole compaction.
+        lock.lock();
+        aborted = shutting_down_;
+        if (!aborted && imm_ != nullptr) {
+          s = FlushImmutable(lock);
+          cv_.notify_all();
+        }
+        lock.unlock();
+        if (aborted || !s.ok()) break;
+      }
+      current_key.assign(e->user_key);
+      has_key = true;
+    }
+
+    bool drop = false;
+    if (!new_key && last_seq_for_key <= oldest_snapshot) {
+      drop = true;  // a newer version is visible to every snapshot
+    } else if (e->type == ValueType::kDeletion &&
+               e->sequence <= oldest_snapshot &&
+               IsBaseLevelForKey(*base, out_level, e->user_key)) {
+      drop = true;  // tombstone with nothing below it to hide
+    }
+    last_seq_for_key = e->sequence;
+    if (drop) continue;
+
+    if (builder == nullptr) {
+      FileMeta out;
+      out.number = next_file_number_.fetch_add(1);
+      out.smallest.assign(merged->key());
+      pending_outputs_.insert(out.number);
+      outputs.push_back(std::move(out));
+      s = WritableFile::Open(TableFileName(path_, outputs.back().number),
+                             &file);
+      if (!s.ok()) break;
+      builder = std::make_unique<TableBuilder>(TableOptions(), file.get());
+    }
+    outputs.back().largest.assign(merged->key());
+    builder->Add(merged->key(), merged->value());
+  }
+  if (s.ok() && !aborted) s = merged->status();
+  if (s.ok() && !aborted && builder != nullptr) s = finish_output();
+  merged.reset();
+
   lock.lock();
-  return Status::OK();
+  if (s.ok() && !aborted) {
+    // Apply the edit to the current version, which may have gained L0 files
+    // from flushes that ran during the compaction.
+    Version next = *version_;
+    auto is_input = [&](const FileMeta& f) {
+      return std::any_of(inputs.begin(), inputs.end(), [&](const FileMeta* in) {
+        return in->number == f.number;
+      });
+    };
+    for (int l : {level, out_level}) {
+      std::erase_if(next.levels[l], is_input);
+    }
+    auto& dst = next.levels[out_level];
+    dst.insert(dst.end(), outputs.begin(), outputs.end());
+    std::sort(dst.begin(), dst.end(), [](const FileMeta& a, const FileMeta& b) {
+      return CompareInternalKey(a.smallest, b.smallest) < 0;
+    });
+    s = CommitVersion(lock, std::move(next), persisted_log_number_,
+                      persisted_last_sequence_, /*clear_imm=*/false);
+  }
+  for (const FileMeta& out : outputs) {
+    pending_outputs_.erase(out.number);
+    if (!s.ok() || aborted) {
+      static_cast<void>(RemoveFile(TableFileName(path_, out.number)));
+    }
+  }
+  return s;
+}
+
+void DBImpl::TEST_WaitForBackgroundWork() {
+  std::unique_lock<std::mutex> l(mutex_);
+  cv_.wait(l, [this] {
+    return !bg_error_.ok() ||
+           (imm_ == nullptr && PickCompactionLevel(*version_) < 0);
+  });
+}
+
+void DBImpl::TEST_CompactAll() {
+  std::unique_lock<std::mutex> l(mutex_);
+  for (int level = 0; level + 1 < kNumLevels; ++level) {
+    forced_level_ = level;
+    cv_.notify_all();
+    cv_.wait(l, [&] {
+      return !bg_error_.ok() ||
+             (imm_ == nullptr && version_->levels[level].empty());
+    });
+  }
+  forced_level_ = -1;
+}
+
+int DBImpl::TEST_NumFiles(int level) {
+  std::lock_guard<std::mutex> l(mutex_);
+  return static_cast<int>(version_->levels[level].size());
 }
 
 Status DBImpl::OpenTable(std::uint64_t number, std::uint64_t size,
@@ -320,8 +553,9 @@ Status DBImpl::BuildTable(const MemTable& mem, std::uint64_t number,
 
 // Deletes WALs below log_number, tables not in live (left by a crash between
 // writing a table and committing the manifest), and a stale MANIFEST.tmp.
-// Called only from Recover and the background thread, so no table is being
-// built concurrently.
+// Called only from Recover and the background thread. Tables still being
+// written are in pending_outputs_: a flush that runs in the middle of a
+// compaction must not delete the compaction's unfinished outputs.
 void DBImpl::RemoveObsoleteFiles(std::uint64_t log_number,
                                  const Version& live) {
   std::vector<std::string> names;
@@ -334,7 +568,7 @@ void DBImpl::RemoveObsoleteFiles(std::uint64_t log_number,
       if (type == FileType::kLog) {
         obsolete = number < log_number;
       } else {
-        obsolete = true;
+        obsolete = !pending_outputs_.contains(number);
         for (const auto& level : live.levels) {
           for (const FileMeta& f : level) {
             if (f.number == number) obsolete = false;
