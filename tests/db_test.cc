@@ -72,6 +72,12 @@ class DBTest : public ::testing::Test {
   }
 
   DBImpl* impl() { return static_cast<DBImpl*>(db_.get()); }
+  int FilesBelowL0() {
+    int n = 0;
+    for (int level = 1; level < kNumLevels; ++level)
+      n += impl()->TEST_NumFiles(level);
+    return n;
+  }
 
   std::uint64_t TableBytes() {
     std::uint64_t total = 0;
@@ -430,7 +436,7 @@ TEST_F(DBTest, RandomizedAgainstModelWithSnapshots) {
     if (op % 5000 == 0) CheckAgainstModel(model, nullptr, kKeySpace + 10);
   }
   impl()->TEST_WaitForBackgroundWork();
-  ASSERT_GT(impl()->TEST_NumFiles(1) + impl()->TEST_NumFiles(2), 0);
+  ASSERT_GT(FilesBelowL0(), 0);  // whole levels may already be in L3
   CheckAgainstModel(model, nullptr, kKeySpace + 10);
 
   for (const auto& [snapshot, snap_model] : snapshots) {
@@ -540,7 +546,7 @@ TEST_F(DBTest, SnapshotSurvivesCompaction) {
         Put("filler" + std::to_string(i % 500), std::string(200, 'x')).ok());
   }
   impl()->TEST_WaitForBackgroundWork();
-  ASSERT_GT(impl()->TEST_NumFiles(1) + impl()->TEST_NumFiles(2), 0);
+  ASSERT_GT(FilesBelowL0(), 0);  // whole levels may already be in L3
 
   ReadOptions at_snap;
   at_snap.snapshot = snap;

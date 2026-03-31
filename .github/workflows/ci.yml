@@ -23,4 +23,6 @@ jobs:
         if: matrix.preset == 'tsan'
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure, build, test
+        env:
+          LSM_STRESS_SECONDS: ${{ matrix.preset == 'tsan' && '60' || '5' }}
         run: cmake --workflow --preset ${{ matrix.preset }}
