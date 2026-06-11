@@ -25,4 +25,5 @@ jobs:
       - name: Configure, build, test
         env:
           LSM_STRESS_SECONDS: ${{ matrix.preset == 'tsan' && '60' || '5' }}
+          LSM_CRASH_ITERATIONS: ${{ matrix.preset == 'release' && '1000' || '50' }}
         run: cmake --workflow --preset ${{ matrix.preset }}
