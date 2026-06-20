@@ -229,6 +229,8 @@ Status DBImpl::Write(const WriteOptions& options, const WriteBatch& batch) {
   scratch_.append(rep);
 
   s = log_->AddRecord(scratch_);
+  stats_.wal_bytes.fetch_add(scratch_.size() + log::kHeaderSize,
+                             std::memory_order_relaxed);
   if (s.ok()) s = options.sync ? log_->Sync() : log_->Flush();
   if (s.ok()) s = WriteBatchInternal::InsertInto(rep, first, mem_.get());
   if (!s.ok()) {
@@ -392,6 +394,7 @@ Status DBImpl::Compact(std::unique_lock<std::mutex>& lock, int level) {
     if (st.ok()) st = file->Close();
     FileMeta& out = outputs.back();
     out.size = builder->FileSize();
+    stats_.compaction_bytes.fetch_add(out.size, std::memory_order_relaxed);
     if (st.ok()) st = OpenTable(out.number, out.size, &out.table);
     builder.reset();
     file.reset();
@@ -451,7 +454,7 @@ Status DBImpl::Compact(std::unique_lock<std::mutex>& lock, int level) {
       s = WritableFile::Open(TableFileName(path_, outputs.back().number),
                              &file);
       if (!s.ok()) break;
-      builder = std::make_unique<TableBuilder>(TableOptions(), file.get());
+      builder = std::make_unique<TableBuilder>(TableOpts(), file.get());
     }
     outputs.back().largest.assign(merged->key());
     builder->Add(merged->key(), merged->value());
@@ -511,6 +514,19 @@ void DBImpl::TEST_CompactAll() {
   forced_level_ = -1;
 }
 
+std::uint64_t DBImpl::DataBlockReads() {
+  std::shared_ptr<const Version> v;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    v = version_;
+  }
+  std::uint64_t reads = 0;
+  for (const auto& level : v->levels) {
+    for (const FileMeta& f : level) reads += f.table->data_block_reads();
+  }
+  return reads;
+}
+
 int DBImpl::TEST_NumFiles(int level) {
   std::lock_guard<std::mutex> l(mutex_);
   return static_cast<int>(version_->levels[level].size());
@@ -533,7 +549,7 @@ Status DBImpl::BuildTable(const MemTable& mem, std::uint64_t number,
   Status s = WritableFile::Open(fname, &file);
   if (!s.ok()) return s;
 
-  TableBuilder builder(TableOptions(), file.get());
+  TableBuilder builder(TableOpts(), file.get());
   auto it = mem.NewIterator();
   it->SeekToFirst();
   meta->smallest.assign(it->key());  // imm is never empty
@@ -548,6 +564,7 @@ Status DBImpl::BuildTable(const MemTable& mem, std::uint64_t number,
 
   meta->number = number;
   meta->size = builder.FileSize();
+  stats_.flush_bytes.fetch_add(meta->size, std::memory_order_relaxed);
   return OpenTable(number, meta->size, &meta->table);
 }
 

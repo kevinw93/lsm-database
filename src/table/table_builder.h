@@ -16,7 +16,7 @@ class WritableFile;
 
 struct TableOptions {
   std::size_t block_size = 4096;
-  int bloom_bits_per_key = 10;
+  int bloom_bits_per_key = 10;  // 0: no filter
 };
 
 // Writes an SSTable to file. Not thread-safe. The caller syncs and closes the

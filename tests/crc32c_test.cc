@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <random>
 #include <string>
 
 namespace lsm::crc32c {
@@ -54,6 +55,20 @@ TEST(Crc32cTest, MaskRoundTripsAndChangesValue) {
 
   for (std::uint32_t v : {0u, 1u, 0x80000000u, 0xffffffffu}) {
     EXPECT_EQ(Unmask(Mask(v)), v);
+  }
+}
+
+TEST(Crc32cTest, HardwareAndPortableAgree) {
+  std::mt19937 rng(9);
+  std::string buf(5000, '\0');
+  for (auto& c : buf) c = static_cast<char>(rng());
+  for (int trial = 0; trial < 2000; ++trial) {
+    const std::size_t offset = rng() % 16;  // unaligned starts
+    const std::size_t len = rng() % (buf.size() - offset);
+    const std::uint32_t init = rng();
+    ASSERT_EQ(Extend(init, buf.data() + offset, len),
+              ExtendPortable(init, buf.data() + offset, len))
+        << "offset=" << offset << " len=" << len;
   }
 }
 

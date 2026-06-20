@@ -20,7 +20,7 @@ void TableBuilder::Add(std::string_view key, std::string_view value) {
   // Versions of one user key are adjacent; add it to the filter once.
   const std::string_view user_key = ExtractUserKey(key);
   if (num_entries_ == 0 || user_key != last_user_key_) {
-    filter_.AddKey(user_key);
+    if (options_.bloom_bits_per_key > 0) filter_.AddKey(user_key);
     last_user_key_.assign(user_key);
   }
 
@@ -65,7 +65,12 @@ Status TableBuilder::Finish() {
 
   BlockHandle filter_handle;
   BlockHandle index_handle;
-  if (status_.ok()) WriteBlock(filter_.Finish(), &filter_handle);
+  // An empty filter block reads as "may match" for every key.
+  if (status_.ok()) {
+    WriteBlock(
+        options_.bloom_bits_per_key > 0 ? filter_.Finish() : std::string(),
+        &filter_handle);
+  }
   if (status_.ok()) WriteBlock(index_block_.Finish(), &index_handle);
   if (status_.ok()) {
     std::string footer;

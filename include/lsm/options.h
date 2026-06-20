@@ -12,6 +12,9 @@ struct Options {
 
   // Memtable size at which it is frozen and flushed to an SSTable.
   std::size_t write_buffer_size = 4 * 1024 * 1024;
+
+  // Bloom filter size per key in new tables; 0 disables filters.
+  int bloom_bits_per_key = 10;
 };
 
 struct ReadOptions {

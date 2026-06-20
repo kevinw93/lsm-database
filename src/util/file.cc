@@ -19,10 +19,15 @@ Status PosixError(std::string_view context, int err) {
 }
 
 int SyncFd(int fd) {
-#if defined(__linux__)
+#if defined(__APPLE__)
+  // fsync on macOS doesn't flush the drive's write cache; F_FULLFSYNC does.
+  // Fall back for filesystems that don't support it.
+  if (::fcntl(fd, F_FULLFSYNC) == 0) return 0;
+  return ::fsync(fd);
+#elif defined(__linux__)
   return ::fdatasync(fd);
 #else
-  return ::fsync(fd);  // macOS: does not flush the drive cache
+  return ::fsync(fd);
 #endif
 }
 
@@ -154,7 +159,7 @@ Status SyncDir(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return PosixError(path, errno);
   Status s;
-  if (::fsync(fd) != 0) s = PosixError(path, errno);
+  if (SyncFd(fd) != 0) s = PosixError(path, errno);
   ::close(fd);
   return s;
 }

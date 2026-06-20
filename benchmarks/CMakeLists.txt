@@ -16,3 +16,7 @@ function(lsm_add_benchmark name)
 endfunction()
 
 lsm_add_benchmark(coding_bench)
+
+add_executable(lsm_bench lsm_bench.cc)
+target_include_directories(lsm_bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(lsm_bench PRIVATE lsm lsm_warnings)

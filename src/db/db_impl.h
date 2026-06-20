@@ -14,6 +14,7 @@
 #include "db/memtable.h"
 #include "db/version.h"
 #include "lsm/db.h"
+#include "table/table_builder.h"
 #include "util/file.h"
 
 namespace lsm {
@@ -31,6 +32,16 @@ class DBImpl final : public DB {
 
   // Called once by DB::Open before the DB is shared.
   Status Recover();
+
+  // Bytes written to disk, for measuring write amplification.
+  struct Stats {
+    std::atomic<std::uint64_t> wal_bytes{0};
+    std::atomic<std::uint64_t> flush_bytes{0};
+    std::atomic<std::uint64_t> compaction_bytes{0};
+  };
+  const Stats& stats() const { return stats_; }
+  // Data blocks read by tables in the current Version.
+  std::uint64_t DataBlockReads();
 
   // For tests: blocks until no flush or compaction is pending.
   void TEST_WaitForBackgroundWork();
@@ -74,6 +85,11 @@ class DBImpl final : public DB {
   std::uint64_t MaxBytesForLevel(int level) const;
   std::uint64_t TargetFileSize() const {
     return 2 * options_.write_buffer_size;
+  }
+  TableOptions TableOpts() const {
+    TableOptions t;
+    t.bloom_bits_per_key = options_.bloom_bits_per_key;
+    return t;
   }
   Status Compact(std::unique_lock<std::mutex>& lock, int level);
   Status BuildTable(const MemTable& mem, std::uint64_t number, FileMeta* meta);
@@ -119,6 +135,8 @@ class DBImpl final : public DB {
   // Highest sequence number whose batch is fully in mem_. Published after
   // the memtable insert, so readers never see part of a batch.
   std::atomic<SequenceNumber> last_sequence_{0};
+
+  Stats stats_;
 
   std::thread bg_thread_;  // declared last: started after everything above
 };
