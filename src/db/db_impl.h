@@ -105,7 +105,8 @@ class DBImpl final : public DB {
 
   std::mutex write_mutex_;
   std::unique_ptr<log::Writer> log_;  // guarded by write_mutex_
-  // First WAL failure; later writes fail with it (see A3 notes).
+  // First WAL failure. Every later write returns it: the log may end in a
+  // partial record, which would hide anything appended after it.
   Status write_error_;   // guarded by write_mutex_
   std::string scratch_;  // guarded by write_mutex_
 
@@ -138,7 +139,7 @@ class DBImpl final : public DB {
 
   Stats stats_;
 
-  std::thread bg_thread_;  // declared last: started after everything above
+  std::thread bg_thread_;
 };
 
 }  // namespace lsm

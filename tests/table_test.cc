@@ -168,9 +168,9 @@ TEST_F(TableTest, SeekSemanticsAcrossBlocks) {
   EXPECT_EQ(user_key_at("k01999"), "<end>");
   EXPECT_EQ(user_key_at("z"), "<end>");
 
-  // Every seek target, including ones that fall between blocks, then Next
-  // across the block boundary.
-  for (int i = 0; i < 1996; ++i) {  // every target whose successor exists
+  // Every seek target whose successor exists, including targets between
+  // blocks, then Next across the block boundary.
+  for (int i = 0; i < 1996; ++i) {
     char target[16];
     char want[16];
     std::snprintf(target, sizeof(target), "k%05d", i);

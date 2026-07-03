@@ -39,8 +39,7 @@ void TableBuilder::FlushDataBlock() {
   data_block_.Reset();
   if (!status_.ok()) return;
 
-  // Keyed by the block's last key: a seek for target goes to the first block
-  // whose last key >= target, which is the only block that can contain it.
+  // Keyed by the block's last key, so a seek reads exactly one block.
   std::string encoded;
   EncodeBlockHandle(&encoded, handle);
   index_block_.Add(last_key_, encoded);

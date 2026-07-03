@@ -10,8 +10,7 @@ namespace lsm::crc32c {
 // Extend(Value(a), b) == Value(a + b).
 std::uint32_t Extend(std::uint32_t init_crc, const char* data, std::size_t n);
 
-// The table-driven implementation, which Extend uses when the CPU lacks
-// CRC32C instructions. Exposed so tests can check both paths agree.
+// Table-driven fallback for CPUs without CRC32C instructions. For tests.
 std::uint32_t ExtendPortable(std::uint32_t init_crc, const char* data,
                              std::size_t n);
 

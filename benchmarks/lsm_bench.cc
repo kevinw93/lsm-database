@@ -1,5 +1,4 @@
-// db_bench-style driver: 16-byte keys, 100-byte values. Each workload runs
-// next to a baseline that explains it.
+// db_bench-style driver: 16-byte keys, 100-byte values.
 //
 //   lsm_bench [--num=1000000] [--dir=/tmp/lsm_bench]
 

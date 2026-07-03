@@ -494,7 +494,7 @@ TEST_F(DBTest, IteratorKeepsItsViewWhileFilesChangeUnderIt) {
   ASSERT_FALSE(tables.empty());
 
   // Later writes, more flushes, and the iterator's own table files unlinked
-  // (as compaction will do): it holds open handles, so its view is intact.
+  // (as compaction does): it holds open handles, so its view is intact.
   for (int i = 0; i < 1000; ++i) {
     ASSERT_TRUE(Put("k" + std::to_string(i), "new").ok());
     ASSERT_TRUE(db_->Delete(WriteOptions(), "k" + std::to_string(i + 1)).ok());

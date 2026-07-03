@@ -55,7 +55,6 @@ class Block::Iter final : public Iterator {
   void SeekToFirst() override { SeekToIndex(0); }
 
   void Seek(std::string_view target) override {
-    // First entry with key >= target.
     std::uint32_t lo = 0;
     std::uint32_t hi = block_->num_entries_;
     while (lo < hi) {
@@ -87,7 +86,7 @@ class Block::Iter final : public Iterator {
     if (i < block_->num_entries_) Decode(i, &key_, &value_);
   }
 
-  // Bounds-checks the entry, so a bad block can't cause an out-of-range read.
+  // Bounds-checked: a bad block yields Corruption, never an out-of-range read.
   bool Decode(std::uint32_t i, std::string_view* key, std::string_view* value) {
     const char* base = block_->data_.data();
     const char* limit = base + block_->offsets_start_;

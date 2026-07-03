@@ -15,12 +15,10 @@ namespace lsm {
 
 class RandomAccessFile;
 
-// Immutable, open SSTable. Thread-safe: Get and NewIterator may be called
-// concurrently. The index block and Bloom filter stay in memory; each data
-// block access is one pread (served by the OS page cache when warm).
+// Immutable, open SSTable. Thread-safe. The index block and Bloom filter stay
+// in memory; each data block access is one pread.
 class Table {
  public:
-  // Reads the footer, index block, and filter block.
   static Status Open(std::unique_ptr<RandomAccessFile> file,
                      std::uint64_t file_size, std::unique_ptr<Table>* table);
 

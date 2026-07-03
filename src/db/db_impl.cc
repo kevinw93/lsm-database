@@ -102,10 +102,9 @@ Status DBImpl::Recover() {
   persisted_last_sequence_ = state.last_sequence;
   RemoveObsoleteFiles(state.log_number, *version);
 
-  // Never append to a replayed log: its tail may be a torn record, and
-  // anything written after it would be unreachable on the next recovery.
-  // mem_ now spans the replayed logs and this new one; once mem_ is flushed,
-  // all of them are obsolete.
+  // Never append to a replayed log: records after a torn tail would be
+  // unreachable on the next recovery. mem_ spans the replayed logs and this
+  // one, so flushing mem_ retires all of them.
   mem_log_number_ = next_file_number_.fetch_add(1);
   s = NewLogFile(mem_log_number_);
   if (!s.ok()) return s;
@@ -123,8 +122,8 @@ Status DBImpl::ReplayLogFile(std::uint64_t number, SequenceNumber* last) {
   log::Reader reader(contents);
   std::string_view record;
   while (reader.ReadRecord(&record)) {
-    // A record that passed its CRC but doesn't parse was written that way:
-    // a bug, not a torn write. Refuse to open rather than guess.
+    // Passed its CRC but doesn't parse: written that way, so a bug rather
+    // than a torn write.
     if (record.size() < 8) {
       return Status::Corruption(fname, "log record too short");
     }
@@ -133,9 +132,8 @@ Status DBImpl::ReplayLogFile(std::uint64_t number, SequenceNumber* last) {
     std::uint32_t count = 0;
     s = WriteBatchInternal::Validate(rep, &count);
     if (!s.ok()) return Status::Corruption(fname, s.message());
-    // Sequence numbers are contiguous from the tables through every log:
-    // each log continues from the last record recovered. A gap means records
-    // a previous recovery saw are now unreadable.
+    // Sequence numbers are contiguous from the tables through every log. A
+    // gap means records an earlier recovery saw are now unreadable.
     if (first != *last + 1 || count == 0 ||
         first + count - 1 > kMaxSequenceNumber) {
       return Status::Corruption(fname, "non-contiguous sequence number in log");
@@ -189,8 +187,7 @@ Status DBImpl::MakeRoomForWrite() {
       cv_.wait(l);  // write stall: compaction has fallen behind
       continue;
     }
-    // Only writers touch log_, and we hold write_mutex_, so the new log is
-    // created without holding mutex_ and readers are not blocked on its I/O.
+    // log_ is guarded by write_mutex_, so its I/O runs without mutex_.
     l.unlock();
     const std::uint64_t log_number = next_file_number_.fetch_add(1);
     static_cast<void>(log_->Close());  // every record was already flushed
@@ -269,8 +266,8 @@ Status DBImpl::CommitVersion(std::unique_lock<std::mutex>& lock, Version next,
   state.last_sequence = last_sequence;
   state.version = std::move(next);
   lock.unlock();
-  // Commit point: once the manifest is renamed into place, the new files are
-  // live and the old ones (and WALs below log_number) are garbage.
+  // Commit point: afterwards the replaced files and WALs below log_number
+  // are garbage.
   Status s = WriteManifest(path_, state);
   auto installed = std::make_shared<const Version>(std::move(state.version));
   lock.lock();
@@ -419,8 +416,8 @@ Status DBImpl::Compact(std::unique_lock<std::mutex>& lock, int level) {
       if (builder != nullptr && builder->FileSize() >= TargetFileSize()) {
         s = finish_output();
         if (!s.ok()) break;
-        // Between outputs: honor shutdown, and let a waiting flush run so
-        // writers aren't stalled for the whole compaction.
+        // Between outputs: honor shutdown and run a pending flush, so writers
+        // don't stall for the whole compaction.
         lock.lock();
         aborted = shutting_down_;
         if (!aborted && imm_ != nullptr) {
@@ -568,11 +565,10 @@ Status DBImpl::BuildTable(const MemTable& mem, std::uint64_t number,
   return OpenTable(number, meta->size, &meta->table);
 }
 
-// Deletes WALs below log_number, tables not in live (left by a crash between
-// writing a table and committing the manifest), and a stale MANIFEST.tmp.
-// Called only from Recover and the background thread. Tables still being
-// written are in pending_outputs_: a flush that runs in the middle of a
-// compaction must not delete the compaction's unfinished outputs.
+// Deletes WALs below log_number, tables not in live or pending_outputs_, and
+// a stale MANIFEST.tmp. Called only from Recover and the background thread.
+// pending_outputs_ protects a compaction's uninstalled outputs from a flush
+// that runs in the middle of it.
 void DBImpl::RemoveObsoleteFiles(std::uint64_t log_number,
                                  const Version& live) {
   std::vector<std::string> names;

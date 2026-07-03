@@ -28,8 +28,7 @@ char* Arena::AllocateAligned(std::size_t bytes) {
 }
 
 char* Arena::AllocateFallback(std::size_t bytes) {
-  // Large requests get a dedicated block so the rest of the current block
-  // isn't wasted.
+  // Large requests get their own block; the current block stays usable.
   if (bytes > kBlockSize / 4) return AllocateNewBlock(bytes);
 
   alloc_ptr_ = AllocateNewBlock(kBlockSize);

@@ -5,8 +5,7 @@
 //   entry* | fixed32 offset[n] | fixed32 n
 //   entry:  varint32 key_size | varint32 value_size | key | value
 //
-// Keys are internal keys in CompareInternalKey order. The offset array allows
-// binary search within the block.
+// Keys are internal keys in CompareInternalKey order.
 
 #include <cstdint>
 #include <memory>

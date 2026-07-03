@@ -158,7 +158,7 @@ TEST(MemTableTest, SeekLandsOnFirstEntryAtOrAfterTarget) {
 
   EXPECT_FALSE(seek_user_key("f", kMaxSequenceNumber));
 
-  it->Seek(IKey("c", 5, ValueType::kValue));  // exact match
+  it->Seek(IKey("c", 5, ValueType::kValue));
   ASSERT_TRUE(it->Valid());
   EXPECT_EQ(it->value(), "c5");
   it->Next();
@@ -176,7 +176,6 @@ TEST(MemTableTest, MemoryUsageGrows) {
   EXPECT_GE(mem.ApproximateMemoryUsage(), before + 100 * value.size());
 }
 
-// Compares Get at random snapshots and full iteration against a simple model.
 TEST(MemTableTest, RandomizedAgainstModel) {
   MemTable mem;
   // user_key -> seq -> value, or nullopt for a tombstone
@@ -223,9 +222,8 @@ TEST(MemTableTest, RandomizedAgainstModel) {
   EXPECT_EQ(Scan(mem), expected);
 }
 
-// One writer, eight lock-free readers. Run under TSan to check the memory
-// ordering; the assertions check that readers never see a partially
-// published entry or miss an acknowledged one.
+// Run under TSan. Readers must never see a partially published entry or miss
+// an acknowledged one.
 TEST(MemTableTest, ConcurrentWriterAndReaders) {
   constexpr SequenceNumber kWrites = 20000;
   constexpr int kReaders = 8;

@@ -57,7 +57,7 @@ class TwoLevelIterator final : public Iterator {
 
   void SkipEmptyBlocks() {
     while (data_ == nullptr || !data_->Valid()) {
-      if (data_ != nullptr && !data_->status().ok()) return;  // stop on error
+      if (data_ != nullptr && !data_->status().ok()) return;
       if (!index_->Valid()) {
         data_.reset();
         return;

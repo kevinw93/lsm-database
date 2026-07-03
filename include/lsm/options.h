@@ -24,7 +24,7 @@ struct ReadOptions {
 };
 
 struct WriteOptions {
-  // fsync the WAL before acknowledging the write.
+  // Make the WAL record durable before acknowledging the write.
   bool sync = false;
 };
 
